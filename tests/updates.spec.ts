@@ -325,7 +325,7 @@ describe('standard ACP update projection', () => {
     expect(sessionTitleUpdate(event)).toEqual({ sessionUpdate: 'session_info_update', title: 'Fix the flaky bridge test' })
   })
 
-  it('lists effective commands one-to-one and dedupes shadowed names', () => {
+  it('lists effective commands one-to-one and dedupes shadowed names', async () => {
     const agent = {} as Agent
     const commands = {
       list: () => [
@@ -335,7 +335,8 @@ describe('standard ACP update projection', () => {
         { name: 'init', description: 'Shadowed duplicate' },
       ],
     }
-    expect(availableCommandsUpdate(commands, agent)).toEqual({
+    const warn = (): void => { throw new Error('the command path must not warn') }
+    expect(await availableCommandsUpdate(commands, undefined, agent, '/tmp/project', warn)).toEqual({
       sessionUpdate: 'available_commands_update',
       availableCommands: [
         { name: 'init', description: 'Scaffold a workspace' },
@@ -343,7 +344,46 @@ describe('standard ACP update projection', () => {
       ],
     })
     // Without a composed registry there is nothing to publish.
-    expect(availableCommandsUpdate(undefined, agent)).toBeUndefined()
+    expect(await availableCommandsUpdate(undefined, undefined, agent, '/tmp/project', warn)).toBeUndefined()
+  })
+
+  it('appends user-invocable skills after commands and yields names to the host registry', async () => {
+    const agent = {} as Agent
+    const commands = { list: () => [{ name: 'plan', description: 'Switch to plan mode' }] }
+    const skills = {
+      list: async () => [
+        { name: 'pdf', description: 'Extract PDF text', invocation: { userInvocable: true, modelInvocable: false } },
+        { name: 'internal', description: 'Model-only', invocation: { userInvocable: false, modelInvocable: true } },
+        // A skill colliding with a real command never displaces the command.
+        { name: 'plan', description: 'Skill shadow', invocation: { userInvocable: true, modelInvocable: true } },
+      ],
+    }
+    const warn = (): void => { throw new Error('a healthy catalog must not warn') }
+    expect(await availableCommandsUpdate(commands, skills, agent, '/tmp/project', warn)).toEqual({
+      sessionUpdate: 'available_commands_update',
+      availableCommands: [
+        { name: 'plan', description: 'Switch to plan mode' },
+        { name: 'pdf', description: 'Extract PDF text', input: { hint: 'instructions for the skill' } },
+      ],
+    })
+  })
+
+  it('keeps the command roster when the skill catalog read fails', async () => {
+    const agent = {} as Agent
+    const commands = { list: () => [{ name: 'init', description: 'Scaffold a workspace' }] }
+    const warnings: string[] = []
+    const update = await availableCommandsUpdate(
+      commands,
+      { list: async () => { throw new Error('provider unreachable') } },
+      agent,
+      '/tmp/project',
+      (message) => { warnings.push(message) },
+    )
+    expect(update).toEqual({
+      sessionUpdate: 'available_commands_update',
+      availableCommands: [{ name: 'init', description: 'Scaffold a workspace' }],
+    })
+    expect(warnings).toEqual(['acp: skill catalog read failed: provider unreachable'])
   })
 
   it('projects committed plan-mode switches onto the advertised mode ids', () => {

@@ -3,7 +3,8 @@
  * channel. ACP v1 has no free-text input request, so a question is
  * representable only as a single-choice menu: the bridge maps its options onto
  * one-shot `session/request_permission` options and answers with the chosen
- * label. A plan-review intent maps the approve label to `allow_once` and every
+ * label, and carries the question body on the rendered card's content blocks
+ * and rawInput so the client shows what is being asked, not just the title. A plan-review intent maps the approve label to `allow_once` and every
  * other option to `reject_once`; without an intent every option is `allow_once`,
  * because the label, not the kind, carries the choice. Everything else —
  * multi-select, free text, unnamed options — delegates back to the waterfall,
@@ -33,6 +34,11 @@ function unrepresentableReason(question: AskUserQuestionItem): string | undefine
 /** The synthesized tool-call identity the permission dialog renders for one question. */
 function questionToolCallId(questionId: string): string {
   return `acp-question:${questionId}`
+}
+
+/** The card body text: the question, followed by its supporting detail when present. */
+function questionText(question: AskUserQuestionItem): string {
+  return question.detail === undefined ? question.question : `${question.question}\n\n${question.detail}`
 }
 
 /** Inputs the ACP connection owns; the bridge stays a pure protocol mapping. */
@@ -85,7 +91,12 @@ async function askOne(
   const approve = question.intent?.approve
   const params: RequestPermissionRequest = {
     sessionId: bridge.sessionId,
-    toolCall: { toolCallId: questionToolCallId(question.id), title: question.header ?? question.question },
+    toolCall: {
+      toolCallId: questionToolCallId(question.id),
+      title: question.header ?? question.question,
+      content: [{ type: 'content', content: { type: 'text', text: questionText(question) } }],
+      rawInput: question,
+    },
     options: options.map(option => ({
       optionId: option.label,
       name: option.label,

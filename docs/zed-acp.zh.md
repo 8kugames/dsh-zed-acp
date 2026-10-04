@@ -15,7 +15,7 @@
 把 CLI 钉到插件对应的版本，把 Zed ACP 插件装进一个 profile，再在 Zed 的 `settings.json` 中注册该 profile：
 
 ```sh
-npm install -g @deepseek-ai/dsh@0.2.0-rc.1
+npm install -g @deepseek-ai/dsh@0.2.0-rc.2
 dsh plugin --profile zed add "github:8kugames/dsh-zed-acp#zed-acp"
 ```
 
@@ -63,6 +63,39 @@ agent 面板的模式选择器提供 **Default** 与 **Plan**。计划模式即 
 ## 关注后台子代理
 
 当 agent 委派 continuable 子代理（`backgroundMode: continuable`）时，被派生的工作会超出启动它的工具调用的生命周期，因此 bridge 会让回合保持打开直到全部后台后代空闲——面板维持忙碌状态，而不是在工作仍在进行时就报告请求已完成。取消会立即结算回合，仍在运行的工作以每个活动期一张合成工具卡（`Background subagent`，运行中显示 in-progress）保持可见。之后重开会话时，每个后代的持久命运会从子会话自身的日志回放——被中断或崩溃的工作结算为 `failed`，完成的工作结算为 `completed`——被中断的委派无法冒充早结算 spawn 调用的成功。回合完全结算后再次被唤醒的后代只会开新卡，不会重新打开已结束的回合。
+
+## 从某条回复分叉
+
+ACP `session/fork` 会把一个已有会话复制成一个独立的新会话，源会话完全不被改动。若客户端在请求的 `_meta` 里带上 `jetbrains.air.fork`（版本 1，`inclusive`），新会话会**保留选中的那条助手回复及其之前的所有内容**，并丢弃它之后的一切——这正是"从这条回复往下另开一条"的语义。
+
+`messageId` 是那条回复的 ACP id（`<turn>:<step>`；流式分片 id `<turn>:<step>:segment:<n>` 也可，匹配到整条消息）。如果客户端重用了计数器导致 id 指向了另一条回复，可以用 `messageFingerprint`（`sha256:` + 助手可见文本的 SHA-256）钉死；`messageOccurrence`（从 1 开始）用于在指纹重复时消歧。
+
+指向的回复带工具调用时，这些调用会从复制的那条消息里移除：它们的结果记录在消息之后，只留调用会构成非法转录，也会让子会话的 `session/load` 回放越过分叉点。更早的调用与结果原样保留。
+
+找不到分叉点、指纹不符、版本不支持，一律回 `invalidParams`——**不会**悄悄退化成整会话复制，因为那样会让客户端在毫无察觉的情况下从错误的位置分叉。
+
+分叉子会话是平台原生的 fork 血缘（`isSeeded` 加精确的继承前缀长度），经 `buildForkSeed` 补齐开放尾部，所以它不会继承半开的回合，并且与普通根会话一样可列出、可重开、可继续对话。分叉继承的是对话，不是路由状态：在非默认模型上分叉会落到组合默认模型，fork 响应里带着子会话的完整 `configOptions`，可在发 prompt 前改。
+
+## 回合进行中追加指令
+
+`session/prompt` 正在跑时，客户端可以发自定义扩展方法 `_session/steering` 往这一回合里追加一条消息——不需要取消重来，也不会另起一个请求。消息在当前回合的下一个步骤边界被消费，**发起 `session/prompt` 的那个请求仍然持有该回合**：它的输出流和 stop reason 不变。
+
+- `{ "outcome": "injected" }`：消息已进入正在运行的回合。
+- `{ "outcome": "promptRequired", "reason": "noRunningTurn" }`：此刻没有回合可加入（例如尚未发起 prompt，或回合已经结束）。此时由客户端发一条普通的 `session/prompt`。
+
+bridge 只在确实有运行中的回合时才调用 agent 的注入原语，绝不替客户端开启一个没有请求在等它的回合——否则那个回合的 stop reason、费用归属和输出流都没有主人。
+
+注意：模型调用还在进行时并没有步骤边界，追加的消息会停在收件箱里直到下一个边界；此时取消回合会丢弃它。内容准入与 `session/prompt` 完全同路，这条连接没通告的块（比如未通告的 inline 图片）同样会被拒绝。
+
+能力通过 `initialize` 的 `_meta.steering.supported` 通告。不发 `_session/steering` 的客户端不受任何影响。
+
+## 使用 skill 斜杠命令
+
+当部署组合了 `@deepseek-ai/dsh-skill` 时，bridge 会把注册表里 `userInvocable` 的 skill 并进斜杠命令目录（`available_commands_update`），与宿主命令注册表的条目合并——同名时命令注册表优先。`modelInvocable` 那一半是给模型的，不进用户菜单。
+
+skill 不需要 bridge 派发：在消息里直接敲 `/skill-name` 走的是 harness 自己的调用手势，bridge 补的只是可发现性。目录只读摘要，不读 skill 正文。
+
+本插件的 bundle 不改动组合：默认 `zed` profile 下 `skill-filesystem`（本地来源）与 `tool-skill`（模型侧工具）仍是禁用的，所以要看到 skill 需要部署方自己挂载 provider。目录读取失败只会记一条 warn，命令目录照常送达。
 
 ## 使用自配模型
 

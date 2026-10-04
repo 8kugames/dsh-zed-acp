@@ -34,6 +34,8 @@ import {
   type CancelNotification,
   type CloseSessionRequest,
   type CloseSessionResponse,
+  type ForkSessionRequest,
+  type ForkSessionResponse,
   type InitializeRequest,
   type InitializeResponse,
   type ListSessionsRequest,
@@ -68,13 +70,21 @@ import type {} from '@deepseek-ai/dsh-session-title'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-user-questions'
 import { authenticate as authenticateCredential, acpAuthMethods, resolveApiKeyRef } from './auth.ts'
-import { mountsAcpImageAttachments, supportsAcpImagePrompts } from './content.ts'
+import { AcpContentError, mountsAcpImageAttachments, supportsAcpImagePrompts } from './content.ts'
 import { AcpMcpConfigError } from './mcp.ts'
 import { AcpModelConfigError, createReasoningPreferenceStore, defaultReasoningPreferencePath } from './model-control.ts'
 import { AcpPermissionConfigError } from './permission-control.ts'
 import { AcpPresetConfigError } from './preset-control.ts'
 import { AcpSessionModeConfigError } from './session-mode-control.ts'
+import { acpInclusiveForkCapabilityMeta, parseForkRequest } from './fork.ts'
 import { bridgeAcpQuestions } from './questions.ts'
+import {
+  ACP_STEERING_METHOD,
+  acpSteeringCapabilityMeta,
+  parseSteeringRequest,
+  type AcpSteeringOutcome,
+  type AcpSteeringRequest,
+} from './steering.ts'
 import { AcpSession } from './session.ts'
 import { buildPriceTable } from './stats.ts'
 import { ACP_AGENT_VERSION } from './version.ts'
@@ -244,7 +254,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
     descendantRoots.get(sessionId) ?? sessions.get(sessionId)
   ctx.on('agent/created', ({ agent }) => {
     const parent = agent.session.header.parentSession
-    if (parent === undefined) return
+    if (parent === undefined || !isDelegatedChild(agent.session.header)) return
     const record = recordOwningSession(parent)
     if (record === undefined) return
     descendantRoots.set(agent.session.id, record)
@@ -310,7 +320,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
           mcpCapabilities: { http: true },
           promptCapabilities: { image: imagePromptEnabled, audio: false, embeddedContext: false },
           loadSession: true,
-          sessionCapabilities: { close: {}, list: {}, resume: {} },
+          sessionCapabilities: { close: {}, list: {}, resume: {}, fork: {} },
+          // Namespaced, versioned extension capabilities. A client that reads
+          // no `_meta` still gets the complete standard path: plain
+          // whole-session `session/fork`, no steering method.
+          _meta: acpAgentCapabilityMeta(),
         },
         authMethods: acpAuthMethods(),
       }
@@ -379,7 +393,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
       activating.add(sessionId)
       return (async (): Promise<ResumeSessionResponse> => {
         const persisted = (await persistence.stat(sessionId, { signal }))?.header
-        if (persisted === undefined || persisted.origin === 'subagent' || persisted.parentSession !== undefined) {
+        if (persisted === undefined || isDelegatedChild(persisted)) {
           throw invalidParams(`session is not resumable: ${sessionId}`)
         }
         if (!await sameDirectory(persisted.cwd, params.cwd)) {
@@ -442,7 +456,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
       activating.add(sessionId)
       return (async (): Promise<LoadSessionResponse> => {
         const persisted = (await persistence.stat(sessionId, { signal }))?.header
-        if (persisted === undefined || persisted.origin === 'subagent' || persisted.parentSession !== undefined) {
+        if (persisted === undefined || isDelegatedChild(persisted)) {
           throw invalidParams(`session is not loadable: ${sessionId}`)
         }
         if (!await sameDirectory(persisted.cwd, params.cwd)) {
@@ -498,6 +512,72 @@ export function apply(ctx: Context, config: AcpConfig): void {
       })().finally(() => { activating.delete(sessionId) })
     },
 
+    async forkSession(params: ForkSessionRequest, signal: AbortSignal): Promise<ForkSessionResponse> {
+      assertOpen()
+      validateWorkspaceParams(params)
+      // Parsed before any allocation: a malformed extension block must not
+      // leave a half-built session behind, and a client that guessed wrong gets
+      // told so instead of silently receiving the whole conversation.
+      const fork = parseForkRequest(params._meta)
+      const sourceId = brandString<SessionId>(params.sessionId)
+      const persisted = (await persistence.stat(sourceId, { signal }))?.header
+      if (persisted === undefined) throw invalidParams(`unknown session: ${sourceId}`)
+      if (isDelegatedChild(persisted)) throw invalidParams(`session is not forkable: ${sourceId}`)
+      if (!await sameDirectory(persisted.cwd, params.cwd)) {
+        throw invalidParams(`session cwd does not match: ${params.cwd}`)
+      }
+      const sessionId = brandString<SessionId>(randomUUID())
+      let record: AcpSession
+      try {
+        record = await AcpSession.fork(ctx, {
+          sessionId,
+          sourceSessionId: sourceId,
+          fork,
+          cwd: params.cwd,
+          mcpServers: params.mcpServers ?? [],
+          agentOptions: agentOptions(config),
+          fallbackSelection: initialSelection(ctx, config),
+          preferenceStore,
+          signal,
+          notify,
+          prices,
+          terminal: { enabled: clientTerminalOutput, cwd: params.cwd },
+        })
+      } catch (error: unknown) {
+        if (error instanceof AcpMcpConfigError) throw invalidParams(error.message)
+        if (error instanceof RequestError) throw error
+        throw internalError(`session/fork failed: ${errorChain(error)}`)
+      }
+      /* v8 ignore next 4 -- a real stdio close can race an in-flight fork. */
+      if (closed) {
+        await record.close('connection closed during session/fork')
+        throw internalError('connection closed during session/fork')
+      }
+      sessions.set(sessionId, record)
+      try {
+        const configOptions = await record.configOptions(signal)
+        const modes = record.modesState()
+        assertOpen()
+        // The child is a seeded session: the factory's own creation is its first
+        // durable write, and the same flush that materializes an empty
+        // `session/new` materializes the inherited prefix.
+        await ctx.sessions.flush(record.agent.session)
+        assertOpen()
+        setImmediate(() => {
+          if (sessions.get(sessionId) === record) record.publishAvailableCommands()
+        })
+        return {
+          sessionId,
+          ...modes === undefined ? {} : { modes },
+          configOptions,
+        }
+      } catch (error: unknown) {
+        sessions.delete(sessionId)
+        await record.close('session/fork activation failed')
+        throw error
+      }
+    },
+
     async listSessions(params: ListSessionsRequest, signal: AbortSignal): Promise<ListSessionsResponse> {
       assertOpen()
       if (params.cwd !== undefined && params.cwd !== null && !isAbsolute(params.cwd)) {
@@ -515,8 +595,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
           sessions.has(header.id)
             || activating.has(header.id)
             || ctx.sessions.get(header.id) !== undefined
-            || header.origin === 'subagent'
-            || header.parentSession !== undefined
+            || isDelegatedChild(header)
             || header.cwd === undefined
             || !isAbsolute(header.cwd)
         ) return undefined
@@ -601,6 +680,22 @@ export function apply(ctx: Context, config: AcpConfig): void {
       return record.prompt(params, imagePromptEnabled, requestSignal)
     },
 
+    async steer(params: AcpSteeringRequest, signal: AbortSignal): Promise<AcpSteeringOutcome> {
+      assertOpen()
+      const record = requireSession(brandString<SessionId>(params.sessionId))
+      try {
+        return await record.steer(params.prompt, imagePromptEnabled, signal)
+      } catch (error: unknown) {
+        if (error instanceof AcpContentError) {
+          throw error.kind === 'invalid'
+            ? invalidParams(error.message)
+            : internalError(error.message)
+        }
+        if (error instanceof RequestError) throw error
+        throw internalError(`steering failed: ${errorChain(error)}`)
+      }
+    },
+
     cancel(params: CancelNotification): Promise<void> {
       sessions.get(brandString<SessionId>(params.sessionId))?.cancel()
       return Promise.resolve()
@@ -629,6 +724,8 @@ export function apply(ctx: Context, config: AcpConfig): void {
     .onRequest(methods.agent.session.close, ({ params }) => implementation.closeSession(params))
     .onRequest(methods.agent.session.setConfigOption, ({ params, signal }) => implementation.setSessionConfigOption(params, signal))
     .onRequest(methods.agent.session.setMode, ({ params }) => implementation.setSessionMode(params))
+    .onRequest(methods.agent.session.fork, ({ params, signal }) => implementation.forkSession(params, signal))
+    .onRequest(ACP_STEERING_METHOD, parseSteeringRequest, ({ params, signal }) => implementation.steer(params, signal))
     .onRequest(methods.agent.session.prompt, ({ params, signal }) => implementation.prompt(params, signal))
     .onRequest(methods.agent.session.load, ({ params, signal }) => implementation.loadSession(params, signal))
   const connection = app.connect(stream)
@@ -782,7 +879,24 @@ function compareSessionIds(left: string, right: string): number {
   return Buffer.compare(Buffer.from(left), Buffer.from(right))
 }
 
-/** Reject workspace features outside the automation contract. */
+/**
+ * The namespaced, versioned extension capabilities this connection advertises
+ * in `agentCapabilities._meta`.
+ *
+ * Every entry here is discoverability only: the standard path stays complete
+ * without it. `sessionCapabilities.fork` above is what actually gates
+ * `session/fork`; a client that never reads this block still forks a whole
+ * session. `steering.supported` advertises the custom `_session/steering`
+ * method, and `jetbrains.air.fork` the inclusive message-point extension on top
+ * of it.
+ * @returns the `_meta` capability block for `initialize`.
+ */
+function acpAgentCapabilityMeta(): Record<string, unknown> {
+  return { ...acpSteeringCapabilityMeta(), ...acpInclusiveForkCapabilityMeta() }
+}
+
+/**
+ * Reject workspace features outside the automation contract. */
 function validateWorkspaceParams(params: { cwd: string; additionalDirectories?: string[] | null }): void {
   if (!isAbsolute(params.cwd)) throw invalidParams(`cwd must be an absolute path: ${params.cwd}`)
   if (
@@ -792,6 +906,23 @@ function validateWorkspaceParams(params: { cwd: string; additionalDirectories?: 
   ) {
     throw invalidParams('additionalDirectories is not supported')
   }
+}
+
+/**
+ * Whether a stored header belongs to a delegated subagent, which a top-level
+ * ACP surface never lists, loads, or forks.
+ *
+ * `parentSession` alone is *not* the test. It is the platform's fork-lineage
+ * field, so a `session/fork` child carries the same header lineage a spawn
+ * child does; only the spawn tool additionally stamps `origin: 'subagent'`.
+ * Keying the gates on the origin stamp is what keeps a forked session a
+ * first-class root — listable, loadable, resumable, and promptable — instead of
+ * stranding every fork as a write-only record.
+ * @param header - the persisted or live session header being classified.
+ * @returns true when the header is a delegated descendant.
+ */
+function isDelegatedChild(header: SessionHeader): boolean {
+  return header.origin === 'subagent'
 }
 
 /** Compare existing directories by physical identity and missing paths lexically. */

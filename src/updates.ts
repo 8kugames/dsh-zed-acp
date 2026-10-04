@@ -11,12 +11,14 @@ import type {
   ToolKind,
 } from '@agentclientprotocol/sdk'
 import type { CommandRuntime } from '@deepseek-ai/dsh-commands'
+import type {} from '@deepseek-ai/dsh-skill'
 import type { FileDiff } from '@deepseek-ai/dsh-tools'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-title'
 import type { TodoItem } from '@deepseek-ai/dsh-tool-todo'
 import type {} from '@deepseek-ai/dsh-token-meter'
 import { assistantBlockToAcp } from './content.ts'
+import { acpSkillCommands, type SkillCatalog } from './skills.ts'
 
 /** The advertised default mode id. */
 export const DEFAULT_MODE_ID = 'default'
@@ -591,18 +593,30 @@ export function sessionTitleUpdate(event: SessionEvent<'session/title'>): Sessio
  * descriptors after scoped shadowing), so the keep-first dedupe below is a
  * defensive guard, not a shadowing rule; if `list` ever emits duplicates, the
  * first listing wins under its current shadow-resolved order.
+ *
+ * User-invocable skills ride the same update, appended after the command
+ * entries so a real command always owns its name. A deployment that composes
+ * no command registry but does mount a skill registry still publishes; only
+ * two absent-or-empty catalogs yield `undefined`.
  * @param commands - host command registry, when the deployment composes one.
+ * @param skills - skill registry, when the deployment composes one.
  * @param agent - exact receiving agent and scoped-layer key.
- * @returns the `available_commands_update`, or `undefined` without a registry.
+ * @param cwd - workspace root the skill catalog is collected for, when the session header records one.
+ * @param warn - diagnostic sink for a failed skill catalog read.
+ * @param signal - optional catalog cancellation.
+ * @returns the `available_commands_update`, or `undefined` with nothing to advertise.
  */
-export function availableCommandsUpdate(
+export async function availableCommandsUpdate(
   commands: Pick<CommandRuntime, 'list'> | undefined,
+  skills: SkillCatalog | undefined,
   agent: Agent,
-): SessionUpdate | undefined {
-  if (commands === undefined) return undefined
+  cwd: string | undefined,
+  warn: (message: string) => void,
+  signal?: AbortSignal,
+): Promise<SessionUpdate | undefined> {
   const seen = new Set<string>()
   const availableCommands: AvailableCommand[] = []
-  for (const descriptor of commands.list(agent)) {
+  for (const descriptor of commands?.list(agent) ?? []) {
     if (seen.has(descriptor.name)) continue
     seen.add(descriptor.name)
     availableCommands.push({
@@ -611,5 +625,13 @@ export function availableCommandsUpdate(
       ...(descriptor.input === undefined ? {} : { input: { hint: descriptor.input.hint } }),
     })
   }
+  for (const skill of await acpSkillCommands(skills, cwd, warn, signal)) {
+    // A command of the same name already claimed this slot; the host registry
+    // stays authoritative for its own namespace.
+    if (seen.has(skill.name)) continue
+    seen.add(skill.name)
+    availableCommands.push(skill)
+  }
+  if (commands === undefined && skills === undefined) return undefined
   return { sessionUpdate: 'available_commands_update', availableCommands }
 }

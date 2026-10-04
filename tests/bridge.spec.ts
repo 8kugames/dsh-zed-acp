@@ -42,7 +42,7 @@ describe('automation-only ACP bridge', () => {
     delete process.env.ACP_BRIDGE_AUTH_KEY
   })
 
-  it('advertises the standard automation controls without private metadata', async () => {
+  it('advertises the standard automation controls plus only namespaced extension capabilities', async () => {
     harness = await makeBridgeHarness()
     const response = await harness.client.initialize({
       protocolVersion: PROTOCOL_VERSION,
@@ -56,7 +56,13 @@ describe('automation-only ACP bridge', () => {
         mcpCapabilities: { http: true },
         promptCapabilities: { image: false, audio: false, embeddedContext: false },
         loadSession: true,
-        sessionCapabilities: { close: {}, list: {}, resume: {} },
+        sessionCapabilities: { close: {}, list: {}, resume: {}, fork: {} },
+        // Only the two advertised extension families — no dsh internals leak
+        // into the standard capability block.
+        _meta: {
+          steering: { supported: true },
+          jetbrains: { air: { fork: { version: 1, inclusive: true } } },
+        },
       },
       authMethods: acpAuthMethods(),
     })
@@ -536,6 +542,8 @@ describe('automation-only ACP bridge', () => {
     vi.spyOn(persistence, 'list').mockResolvedValue(([
       { version: SESSION_FORMAT_VERSION, id: SessionId(active.sessionId), createdAt: 9, isSeeded: false, cwd: process.cwd() },
       { version: SESSION_FORMAT_VERSION, id: SessionId('subagent'), createdAt: 8, isSeeded: false, cwd: '/missing/filter', origin: 'subagent' },
+      // A fork-lineage child carries `parentSession` but no subagent origin
+      // stamp, so it is a first-class root: listable, loadable, resumable.
       { version: SESSION_FORMAT_VERSION, id: SessionId('fork'), createdAt: 7, isSeeded: false, cwd: '/missing/filter', parentSession: SessionId('parent') },
       { version: SESSION_FORMAT_VERSION, id: SessionId('no-cwd'), createdAt: 6, isSeeded: false },
       { version: SESSION_FORMAT_VERSION, id: SessionId('relative'), createdAt: 5, isSeeded: false, cwd: 'relative' },
@@ -551,6 +559,7 @@ describe('automation-only ACP bridge', () => {
     await expect(harness.client.listSessions({ cwd: 'relative' })).rejects.toThrow(/absolute path/)
     await expect(harness.client.listSessions({ cwd: '/missing/filter' })).resolves.toEqual({
       sessions: [
+        { sessionId: 'fork', cwd: '/missing/filter' },
         { sessionId: 'valid-a', cwd: '/missing/filter' },
         { sessionId: 'valid-b', cwd: '/missing/filter' },
       ],

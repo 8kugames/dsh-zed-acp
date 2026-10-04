@@ -3,6 +3,7 @@
 import type { Context } from '@deepseek-ai/cordis'
 import {
   RequestError,
+  type ContentBlock,
   type McpServer,
   type PromptRequest,
   type PromptResponse,
@@ -18,11 +19,23 @@ import type { PermissionPresetService } from '@deepseek-ai/dsh-permission-preset
 import type {} from '@deepseek-ai/dsh-session-projection'
 import type { PlanModeController } from '@deepseek-ai/dsh-plan-mode'
 import { createUserMessage, errorChain, type UserMessage } from '@deepseek-ai/dsh-llm'
-import { type Session, type SessionEvent, type SessionHeader, type SessionId, type TurnEndReason } from '@deepseek-ai/dsh-session'
+import { brandNumber } from '@deepseek-ai/dsh-brand'
+import {
+  type Session,
+  type SessionEvent,
+  type SessionHeader,
+  type SessionId,
+  type SessionLogOffset,
+  type TurnEndReason,
+} from '@deepseek-ai/dsh-session'
+import { buildForkSeed } from '@deepseek-ai/dsh-session/fork'
 import { AcpContentError, admitAcpPrompt } from './content.ts'
 import { turnEndToStopReason } from './codec.ts'
 import { acpConfigOptions } from './config-options.ts'
+import { inclusiveHistoryPrefix, locateForkBoundary, type JetbrainsAirForkRequest } from './fork.ts'
 import { mountAcpMcpServers } from './mcp.ts'
+import type { SkillCatalog } from './skills.ts'
+import { steeringInjected, steeringPromptRequired, type AcpSteeringOutcome } from './steering.ts'
 import { AcpModelControl, type ReasoningPreferenceStore } from './model-control.ts'
 import { AcpPermissionControl, PERMISSION_CONFIG_ID } from './permission-control.ts'
 import { AcpPresetControl, PRESET_CONFIG_ID } from './preset-control.ts'
@@ -83,6 +96,16 @@ export interface CreateAcpSessionOptions extends AcpSessionBuildOptions {
 /** Persisted ACP session construction inputs. */
 export interface ResumeAcpSessionOptions extends AcpSessionBuildOptions {
   sessionId: SessionId
+}
+
+/** Forked ACP session construction inputs. */
+export interface ForkAcpSessionOptions extends AcpSessionBuildOptions {
+  /** The new child session id; never the source's. */
+  sessionId: SessionId
+  /** The source session whose committed log the child inherits. */
+  sourceSessionId: SessionId
+  /** The inclusive fork request, or `undefined` for the ACP whole-session copy. */
+  fork: JetbrainsAirForkRequest | undefined
 }
 
 /** The continuable-subagent teardown used without depending on the subagent package. */
@@ -271,6 +294,99 @@ export class AcpSession {
   }
 
   /**
+   * Derive an independent child session from a source session's committed log.
+   *
+   * The source is never mutated and is not required to be live: its log is read
+   * through a read-only persistence handle, exactly as `session/load` does, so
+   * a client can branch from a session it has not opened. The child is a
+   * platform-native fork seed — `meta.isSeeded` plus the exact inherited
+   * prefix length, with `buildForkSeed` closing an open tail through synthetic
+   * `forked` results and step/turn endings — so a branch never inherits a
+   * half-open turn and the child's own `session/load` replay stops where the
+   * fork did.
+   *
+   * The inherited prefix is conversation, not route state: a fork over a
+   * session that was mid-`tool/call` inherits the call and its result as
+   * committed history, while the child's selected route is re-resolved exactly
+   * as `session/new` does. The fork response returns the child's full
+   * `configOptions`, so a client sees and can change the route before prompting.
+   * ponytail: that means forking a session pinned to a non-default model lands
+   * on the composition default. Inheriting the source's route would need the
+   * last pinned turn read back out of the inherited log, which is the upgrade
+   * path rather than a silent guess here.
+   * @param ctx - ACP plugin context with Agent, LLM, and persistence services.
+   * @param options - child identity, source id, fork request, and notifier.
+   * @returns the forked per-session module.
+   */
+  static async fork(ctx: Context, options: ForkAcpSessionOptions): Promise<AcpSession> {
+    const source = options.sourceSessionId
+    // A live source buffers its committed events until the durability barrier,
+    // and a read handle never sees past that buffer. Without this flush a fork
+    // of the conversation currently on screen — the common case — would read an
+    // empty log and silently branch from nothing. A source that is not live in
+    // this process is already durable, so this is a no-op for it.
+    const live = ctx.sessions.get(source)
+    if (live !== undefined) await ctx.sessions.flush(live)
+    const handle = await ctx.sessionPersistence.open(source, 'read', { signal: options.signal })
+    let events: readonly SessionEvent[]
+    try {
+      events = (await handle.read(0, undefined, { signal: options.signal })).events
+    } finally {
+      await handle.close()
+    }
+    // An absent boundary means the source's last committed event — the ACP
+    // whole-session default — and an empty source forks an empty child.
+    const boundary = options.fork === undefined
+      ? events.at(-1)?.seq
+      : locateForkBoundary(events, options.fork, source)
+    const inherited = boundary === undefined
+      ? []
+      : buildForkSeed(
+        options.fork === undefined ? [...events] : inclusiveHistoryPrefix(events, boundary),
+        boundary,
+      )
+    const presets = ctx.get('agentPresets')
+    const modelControl = new AcpModelControl(
+      ctx.llm,
+      options.fallbackSelection,
+      (message) => { ctx.logger.warn(message) },
+      options.preferenceStore,
+    )
+    const created = await ctx.agents.create({
+      sessionId: options.sessionId,
+      meta: {
+        cwd: options.cwd,
+        // Fork lineage, not delegation: `origin` stays unset so the child is a
+        // listable, loadable, promptable root.
+        isSeeded: true,
+        parentSession: source,
+      },
+      inheritedEventCount: brandNumber<SessionLogOffset>(boundary === undefined ? 0 : Number(boundary) + 1),
+      seed: inherited,
+      agentOptions: options.agentOptions,
+      signal: options.signal,
+      setup: async (agentCtx) => {
+        modelControl.install(agentCtx)
+        if (presets !== undefined) {
+          const agentPreset = await presets.resolve()
+          await presets.mount(agentCtx, agentPreset.id)
+        }
+        await mountAcpMcpServers(agentCtx, options.mcpServers, options.cwd)
+      },
+    })
+    return new AcpSession(
+      ctx,
+      created,
+      modelControl,
+      options.notify,
+      presets,
+      ctx.get('permissionPresets'),
+      options.prices,
+      options.terminal,
+    )
+  }
+
+  /**
    * Whether this module owns an exact Agent reference.
    * @param agent - Agent observed on a scoped runtime event.
    * @returns true only for this session's owned Agent.
@@ -392,16 +508,31 @@ export class AcpSession {
   /**
    * Publish the host registry's effective slash-command roster for this
    * session as an `available_commands_update`, serialized onto the ordered
-   * output tail without blocking execution updates. A deployment without the
-   * command registry publishes nothing.
+   * output tail without blocking execution updates. User-invocable skills from
+   * the skill registry ride the same update. A deployment that composes
+   * neither registry publishes nothing.
+   *
+   * The tail position is captured synchronously, before the skill catalog read
+   * starts, so a roster triggered concurrently with a live turn still lands
+   * after every update queued when it was requested rather than jumping ahead
+   * of them once the read resolves. The read itself runs in parallel with that
+   * drain instead of waiting for it.
    */
   publishAvailableCommands(): void {
     if (this.closing !== undefined) return
-    const update = availableCommandsUpdate(this.ctx.get('commands'), this.agent)
-    if (update === undefined) return
     const previous = this.outputTail
+    const read = availableCommandsUpdate(
+      this.ctx.get('commands'),
+      this.ctx.get('skills') as SkillCatalog | undefined,
+      this.agent,
+      this.agent.session.header.cwd,
+      (message) => { this.ctx.logger.warn(message) },
+    )
     this.outputTail = previous
-      .then(() => this.notify({ sessionId: this.agent.session.id, update }))
+      .then(() => read)
+      .then((update) => update === undefined
+        ? undefined
+        : this.notify({ sessionId: this.agent.session.id, update }))
       /* v8 ignore start -- the bridge notifier contains transport failure. */
       .catch((error: unknown) => {
         this.ctx.logger.warn(`acp: available-commands update failed: ${errorChain(error)}`)
@@ -505,6 +636,56 @@ export class AcpSession {
     } finally {
       requestSignal?.removeEventListener('abort', onRequestAbort)
     }
+  }
+
+  /**
+   * Inject one steered follow-up into this session's running turn.
+   *
+   * The message goes to the nearest *step* boundary of the turn already in
+   * flight, so the running turn keeps its identity and the client's open
+   * `session/prompt` request keeps ownership of the output stream and stop
+   * reason. Content admission is the same `admitAcpPrompt` path a prompted
+   * message takes, so steering cannot smuggle in a block the route or the
+   * connection's image capability would have refused.
+   *
+   * When nothing is running to join, this reports `promptRequired` rather than
+   * starting a turn: the agent's own `steer` would happily begin one, but no
+   * ACP request would be waiting on it, so its stop reason, cost accounting,
+   * and output stream would have no owner.
+   * @param prompt - ACP content blocks to inject.
+   * @param imageEnabled - connection capability advertised at initialization.
+   * @param signal - JSON-RPC request cancellation signal.
+   * @returns `injected`, or `promptRequired` when no turn is running.
+   */
+  async steer(
+    prompt: readonly ContentBlock[],
+    imageEnabled: boolean,
+    signal: AbortSignal,
+  ): Promise<AcpSteeringOutcome> {
+    this.assertActive()
+    if (!this.steerable()) return steeringPromptRequired()
+    const content = await admitAcpPrompt(this.ctx, this.modelControl.snapshot(), prompt, imageEnabled, signal)
+    // Re-check: admission awaits attachment storage, and the turn the message
+    // was aimed at may have settled while it ran.
+    if (!this.steerable()) return steeringPromptRequired()
+    this.agent.steer(createUserMessage({ content, source: { kind: 'user' } }))
+    return steeringInjected()
+  }
+
+  /**
+   * Whether a running turn exists to receive a steered message: the in-flight
+   * prompt holds a claimed turn that has neither ended nor been cancelled.
+   *
+   * `settlementStarted` is deliberately *not* the test — it is set the moment
+   * the prompt is queued, because settlement runs for the whole life of a turn
+   * awaiting quiescence. The precise "this turn is over" fact is `endReason`,
+   * recorded when the turn's own `turn/end` commits.
+   */
+  private steerable(): boolean {
+    const inflight = this.inflight
+    if (inflight === undefined) return false
+    if (inflight.turn === undefined) return false
+    return !inflight.cancelRequested && inflight.endReason === undefined
   }
 
   /** Cancel the active prompt, or autonomous work when no ACP prompt exists. */

@@ -4,11 +4,11 @@
 
 一个面向 [Agent Client Protocol](https://agentclientprotocol.com/) 的服务器，为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 打包成可自由安装的 dsh 插件。它把 `dsh` 变成 [Zed](https://zed.dev)（或任何 ACP 客户端）可以驱动的外部 agent：流式回答与思考过程、带真实文件差异的工具调用、计划模式、agent 预设、权限预设、会话历史与 MCP 服务器。
 
-按 dsh `0.2.0-rc.1` 构建并测试。插件组合在已安装的 harness 之上运行——它不自带运行时，也绝不把你的 key 写进编辑器配置。
+按 dsh `0.2.0-rc.2` 构建并测试。插件组合在已安装的 harness 之上运行——它不自带运行时，也绝不把你的 key 写进编辑器配置。
 
 ## 安装
 
-前置条件：[dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) 钉到插件对应的版本（`npm i -g @deepseek-ai/dsh@0.2.0-rc.1`——npm 的 `latest` 标签可能落后）、Node `^22.19 || >=24`，以及 Zed。
+前置条件：[dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) 钉到插件对应的版本（`npm i -g @deepseek-ai/dsh@0.2.0-rc.2`——npm 的 `latest` 标签可能落后）、Node `^22.19 || >=24`，以及 Zed。
 
 在首个 npm 发布之前，直接从本仓库安装（ref 指向携带插件的分支；合并进 `master` 后改为 `master`）：
 
@@ -64,6 +64,19 @@ dsh plugin --profile zed add -w "link:/absolute/path/to/dsh-zed-acp"
 | 工具调用   | 通用 `other` 类别                   | 标准类别（`edit`/`read`/`search`/`execute`/`fetch`/`switch_mode`）、跟随式 **`locations`**，与 `write`/`edit` 结果的原生**文件差异**                             |
 | 终端       | ——                                  | 命令类工具调用在客户端声明 Zed `terminal_output` 扩展时嵌入**展示终端**，其余客户端保持纯文本投影                                                                |
 | 预设       | 宿主面工具                          | web 式拆分：模型面行移入每个预设自己的组成（`standard`/`ptc`/`minimal`/`cordis`）                                                                                |
+| 分叉       | ——                                  | `session/fork` 走平台原生 fork 血缘；`jetbrains.air.fork` v1 扩展保留选中的助手回复并丢弃其后的全部内容                                                          |
+| 转向       | ——                                  | `_session/steering` 在回合的下一个步骤边界注入追加消息，客户端已打开的 `session/prompt` 仍持有该回合、其输出流与其 stop reason                                   |
+| Skills     | ——                                  | `@deepseek-ai/dsh-skill` 注册表中 `userInvocable` 的条目并入同一份 `available_commands_update` 目录，同名时命令注册表优先                                        |
+
+## 分叉、转向与 skills
+
+`session/fork` 以 `sessionCapabilities.fork` 通告。不带扩展块时，它把源会话的整份已提交日志复制进一个新的独立会话，且完全不触碰源会话。带上 `_meta.jetbrains.air.fork`（版本 1，`inclusive`）时，新会话保留选中的那条助手回复及其之前的一切。消息由 `messageId` 指定（`<turn>:<step>`；`<turn>:<step>:segment:<n>` 形式的分片 id 也会匹配到整条消息），可用 `messageFingerprint`（`sha256:` + 助手可见文本的 SHA-256）钉死，用从 1 开始的 `messageOccurrence` 消歧。选中消息上的工具调用会从副本中移除——它们的结果记录在消息之后，只留调用会构成非法转录。分叉点无法解析时回 `invalidParams`，**不会**静默退化成整会话复制。
+
+分叉子会话是平台 fork 种子（`isSeeded` 加精确继承前缀长度），开放尾部由 `buildForkSeed` 以 `forked` 结果与 step/turn 收尾补齐，因此不会继承半开的回合。fork 血缘设置 `parentSession` 但不设 `origin: 'subagent'`——这正是分支仍是一等根会话的原因：可列出、可重开、可继续对话。分叉继承的是对话而非路由：在非默认模型上分叉会落到组合默认模型，响应里带着子会话的完整 `configOptions` 以便先改后用。
+
+`_session/steering` 是自定义扩展方法，以 `_meta.steering.supported` 通告。它向正在运行的回合追加一条消息，在该回合的下一个步骤边界被消费，回答 `{ outcome: "injected" }` 或 `{ outcome: "promptRequired", reason: "noRunningTurn" }`。bridge 绝不替客户端开启回合：没有请求在等的回合，其 stop reason、费用归属和输出流都没有主人。
+
+skills 不需要派发——`/skill-name` 是 harness 自己的调用手势，bridge 补的只是把注册表中 `userInvocable` 的条目列出来。本插件的 bundle 不改动组合：默认 `zed` profile 下 `skill-filesystem` 与 `tool-skill` 仍是禁用的，所以要看到 skill 需要部署方自己挂载 provider。
 
 ## 回合统计与费用
 
@@ -83,7 +96,7 @@ dsh plugin --profile zed add -w "link:/absolute/path/to/dsh-zed-acp"
 
 ## 兼容性
 
-peer 范围声明为 `~0.2.0-rc.1`：自 `0.2.0-rc.1` 起的 0.2.x 线 dsh 均被接受；dsh 的 profile 启动会在安装与启动时检查它们，并明确报出不兼容的插件。所有 `@deepseek-ai/*` 模块都从宿主安装加载——插件不自带运行时。
+peer 范围声明为 `~0.2.0-rc.2`：自 `0.2.0-rc.2` 起的 0.2.x 线 dsh 均被接受；dsh 的 profile 启动会在安装与启动时检查它们，并明确报出不兼容的插件。所有 `@deepseek-ai/*` 模块都从宿主安装加载——插件不自带运行时。
 
 面向客户端的扩展都有优雅降级：展示终端、计划、会话标题与斜杠命令投射只用标准 ACP 更新；终端本身仅在客户端于 `initialize` 声明 Zed 的 `terminal_output` 能力时激活，未声明的客户端不会看到任何终端形状的更新，继续收到纯文本工具结果。
 

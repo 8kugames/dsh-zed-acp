@@ -37,7 +37,12 @@ describe('ACP user-questions bridge', () => {
     const sessionId = await questionHarness()
     const agent = harness!.ctx.agents.get(SessionId(sessionId))!
     harness!.onPermission = (request) => {
-      expect(request.toolCall).toMatchObject({ toolCallId: 'acp-question:plan-review', title: 'Plan review' })
+      expect(request.toolCall).toMatchObject({
+        toolCallId: 'acp-question:plan-review',
+        title: 'Plan review',
+        content: [{ type: 'content', content: { type: 'text', text: 'Approve this plan and leave plan mode?\n\n# The plan' } }],
+        rawInput: planReviewQuestion(),
+      })
       expect(request.options).toEqual([
         { optionId: 'Approve', name: 'Approve', kind: 'allow_once' },
         { optionId: 'Keep planning', name: 'Keep planning', kind: 'reject_once' },

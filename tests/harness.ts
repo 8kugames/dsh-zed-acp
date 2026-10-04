@@ -2,6 +2,7 @@
 
 import { Context } from '@deepseek-ai/cordis'
 import { createHash } from 'node:crypto'
+import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -10,6 +11,8 @@ import {
   methods,
   ndJsonStream,
   type Agent as AcpAgent,
+  type ForkSessionRequest,
+  type ForkSessionResponse,
   type PromptRequest,
   type PromptResponse,
   type RequestPermissionRequest,
@@ -35,13 +38,22 @@ import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
 import { UserQuestionService } from '@deepseek-ai/dsh-user-questions'
 import * as AcpPlugin from '../src/index.ts'
 import type { AcpConfig } from '../src/index.ts'
+import { ACP_STEERING_METHOD, type AcpSteeringOutcome, type AcpSteeringRequest } from '../src/steering.ts'
+
+/**
+ * One scripted response: a plain chunk list, the literal `'hang'` for a call
+ * that never returns, or `{ chunks, holdMs }` to keep a call open for a bounded
+ * time — the window a steering test needs to act while a turn is still live but
+ * will still reach a next step boundary.
+ */
+export type ScriptedResponse = StreamChunk[] | 'hang' | { chunks: StreamChunk[]; holdMs: number }
 
 /** Scripted adapter for protocol tests. */
 class MockAdapter extends LlmAdapter {
   readonly requests: GenerateOptions[] = []
 
   constructor(
-    private readonly script: (StreamChunk[] | 'hang')[],
+    private readonly script: ScriptedResponse[],
     private readonly imageCapable: boolean,
     private readonly provider = 'mock',
   ) {
@@ -94,15 +106,31 @@ class MockAdapter extends LlmAdapter {
     this.requests.push(options)
     const entry = this.script.shift()
     if (entry === undefined) throw new Error('MockAdapter: script exhausted')
-    if (entry === 'hang') {
-      yield { type: 'block-start', index: 0, blockType: 'text' }
-      yield { type: 'text-delta', index: 0, text: 'partial' }
-      await new Promise<void>((_resolve, reject) => {
-        if (options.signal?.aborted) {
+    if (entry === 'hang' || typeof entry === 'object' && !Array.isArray(entry)) {
+      const chunks = entry === 'hang' ? 'hang' : entry.chunks
+      const holdMs = entry === 'hang' ? undefined : entry.holdMs
+      if (chunks === 'hang') {
+        yield { type: 'block-start', index: 0, blockType: 'text' }
+        yield { type: 'text-delta', index: 0, text: 'partial' }
+        await new Promise<void>((_resolve, reject) => {
+          if (options.signal?.aborted) {
+            reject(new Error('aborted'))
+            return
+          }
+          options.signal?.addEventListener('abort', () => { reject(new Error('aborted')) }, { once: true })
+        })
+        return
+      }
+      for (const chunk of chunks) {
+        if (options.signal?.aborted) throw new Error('aborted')
+        yield chunk
+      }
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, holdMs ?? 0)
+        options.signal?.addEventListener('abort', () => {
+          clearTimeout(timer)
           reject(new Error('aborted'))
-          return
-        }
-        options.signal?.addEventListener('abort', () => { reject(new Error('aborted')) }, { once: true })
+        }, { once: true })
       })
       return
     }
@@ -254,6 +282,26 @@ export class StubPermissionPresets {
   }
 }
 
+/**
+ * Minimal skill-registry stand-in: the merged, name-sorted summary list plus
+ * the invocation-policy half the command roster reads. `failure` reproduces a
+ * provider that cannot be collected, which must not take the roster down.
+ */
+export class StubSkillRegistry {
+  /** Summaries the merged catalog reports, in registry order. */
+  summaries: { name: string; description: string; invocation: { userInvocable: boolean; modelInvocable: boolean } }[] = []
+  /** When set, `list` rejects with this failure instead of answering. */
+  failure: Error | undefined
+  /** The cwd values `list` was called with, for scope assertions. */
+  readonly cwds: (string | undefined)[] = []
+
+  async list(options?: { cwd?: string; signal?: AbortSignal }): Promise<typeof this.summaries> {
+    this.cwds.push(options?.cwd)
+    if (this.failure !== undefined) throw this.failure
+    return this.summaries
+  }
+}
+
 /** The stub cast the bridge consumes; service typing stays on the real class. */
 export interface BridgeHarnessPresets {
   /** The stub's membership state, for assertions. */
@@ -338,8 +386,11 @@ interface BridgeClient {
   closeSession: NonNullable<AcpAgent['closeSession']>
   setSessionConfigOption: NonNullable<AcpAgent['setSessionConfigOption']>
   setSessionMode: NonNullable<AcpAgent['setSessionMode']>
+  forkSession: (params: ForkSessionRequest) => Promise<ForkSessionResponse>
   prompt: (params: PromptRequest, options?: SendRequestOptions) => Promise<PromptResponse>
   cancel: NonNullable<AcpAgent['cancel']>
+  /** The custom `_session/steering` extension method. */
+  steer: (params: AcpSteeringRequest) => Promise<AcpSteeringOutcome>
 }
 
 export interface BridgeHarness {
@@ -353,6 +404,8 @@ export interface BridgeHarness {
   presets: StubAgentPresetRegistry | undefined
   /** The mounted stub permission service; undefined unless the option mounted one. */
   permissions: StubPermissionPresets | undefined
+  /** The mounted stub skill registry; undefined unless the option mounted one. */
+  skills: StubSkillRegistry | undefined
   permissionRequests: RequestPermissionRequest[]
   persistenceRoot: string
   onPermission: (request: RequestPermissionRequest) => RequestPermissionResponse
@@ -369,9 +422,32 @@ export interface BridgeHarness {
 
 type AcpConfigOverrides = { [K in keyof AcpConfig]?: AcpConfig[K] | undefined }
 
+/**
+ * Read one stored session's complete committed log.
+ *
+ * A live session buffers its committed events until the durability barrier, so
+ * a read handle sees nothing until the session is flushed — the same reason
+ * `AcpSession.fork` flushes a live source before reading it. Tests that assert
+ * on durable state must go through this helper or flush themselves.
+ * @param ctx - harness context carrying the persistence service.
+ * @param sessionId - the stored session to read.
+ * @returns the session's committed events in seq order.
+ */
+export async function readSessionLog(ctx: Context, sessionId: string): Promise<readonly SessionEvent[]> {
+  const id = SessionId(sessionId)
+  const live = ctx.sessions.get(id)
+  if (live !== undefined) await ctx.sessions.flush(live)
+  const handle = await ctx.sessionPersistence.open(id, 'read')
+  try {
+    return (await handle.read(0, undefined)).events
+  } finally {
+    await handle.close()
+  }
+}
+
 /** Build the bridge and a connected SDK client over cross-wired byte streams. */
 export async function makeBridgeHarness(options: {
-  script?: (StreamChunk[] | 'hang')[]
+  script?: ScriptedResponse[]
   config?: AcpConfigOverrides
   persona?: string
   imageCapable?: boolean
@@ -387,6 +463,8 @@ export async function makeBridgeHarness(options: {
   permissions?: boolean
   /** Provide the agent-default-model service, as the shipped dsh-base bundle does. */
   defaultModel?: { provider: string; model: string }
+  /** Mount the stub skill registry, as a deployment mounting dsh-skill does. */
+  skills?: boolean
 } = {}): Promise<BridgeHarness> {
   const adapter = new MockAdapter(options.script ?? [], options.imageCapable === true)
   const ctx = new Context()
@@ -411,6 +489,8 @@ export async function makeBridgeHarness(options: {
   }
   const stubPermissions = options.permissions === true ? new StubPermissionPresets() : undefined
   if (stubPermissions !== undefined) ctx.provide('permissionPresets', stubPermissions as unknown as PermissionPresetService)
+  const stubSkills = options.skills === true ? new StubSkillRegistry() : undefined
+  if (stubSkills !== undefined) ctx.provide('skills', stubSkills as never)
   if (options.defaultModel !== undefined) {
     // The real service reads volatile per-profile settings; the stub detaches one fixed selection.
     ctx.provide('agentDefaultModel', { currentSelection: () => ({ ...options.defaultModel }) } as never)
@@ -439,6 +519,7 @@ export async function makeBridgeHarness(options: {
     permissionRequests,
     presets: stubPresets,
     permissions: stubPermissions,
+    skills: stubSkills,
     persistenceRoot,
     onPermission: () => ({ outcome: { outcome: 'cancelled' } }),
     onSessionUpdateError: undefined,
@@ -494,8 +575,10 @@ export async function makeBridgeHarness(options: {
     closeSession: params => client.request(methods.agent.session.close, params),
     setSessionConfigOption: params => client.request(methods.agent.session.setConfigOption, params),
     setSessionMode: params => client.request(methods.agent.session.setMode, params),
+    forkSession: params => client.request(methods.agent.session.fork, params),
     prompt: (params, options) => client.request(methods.agent.session.prompt, params, options),
     cancel: params => client.notify(methods.agent.session.cancel, params),
+    steer: params => client.request<AcpSteeringOutcome, AcpSteeringRequest>(ACP_STEERING_METHOD, params),
   }
   return harness
 }

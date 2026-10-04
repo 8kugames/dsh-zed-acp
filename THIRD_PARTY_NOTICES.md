@@ -24,7 +24,7 @@ in `package-lock.json`.
 | Package                    | Version    | License    |
 | -------------------------- | ---------- | ---------- |
 | `@agentclientprotocol/sdk` | 1.4.0      | Apache-2.0 |
-| `@deepseek-ai/dsh-brand`   | 0.1.7-rc.2 | MIT        |
+| `@deepseek-ai/dsh-brand`   | 0.2.0-rc.2 | MIT        |
 | `@deepseek-ai/schemastery` | ~3.18.4    | MIT        |
 | `commander`                | ^15.0.0    | MIT        |
 

@@ -9,13 +9,13 @@ freely installable dsh plugin. It turns `dsh` into an external agent that
 reasoning, tool calls with real diffs, plan mode, agent presets, permission
 presets, session history, and MCP servers.
 
-Built and tested against dsh `0.2.0-rc.1`. The plugin composes over the
+Built and tested against dsh `0.2.0-rc.2`. The plugin composes over the
 installed harness — it ships no runtime of its own and never pins your key in
 editor config.
 
 ## Install
 
-Prerequisites: [dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) pinned to the version the plugin targets (`npm i -g @deepseek-ai/dsh@0.2.0-rc.1` — the npm `latest` tag may trail it), Node `^22.19 || >=24`, and Zed.
+Prerequisites: [dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) pinned to the version the plugin targets (`npm i -g @deepseek-ai/dsh@0.2.0-rc.2` — the npm `latest` tag may trail it), Node `^22.19 || >=24`, and Zed.
 
 Until the first npm release ships, install from this repository (the ref names the branch carrying the plugin; point it at `master` once merged):
 
@@ -75,6 +75,47 @@ automation-only ACP transport so exactly one server owns stdio.
 | Tool calls           | generic `other` kind                           | standard kinds (`edit`/`read`/`search`/`execute`/`fetch`/`switch_mode`), follow-along **`locations`**, and native **file diffs** from `write`/`edit` results                                                                          |
 | Terminals            | —                                              | command tool calls embed a **display terminal** (Zed's `terminal_output` extension) when the client advertises it; everyone else keeps the plain text projection                                                                      |
 | Presets              | host-plane tools                               | the web-style split: model-facing rows move into each preset's composition (`standard`/`ptc`/`minimal`/`cordis`)                                                                                                                      |
+| Fork                 | —                                              | `session/fork` over the platform's native seed lineage, plus the `jetbrains.air.fork` v1 extension that keeps the selected assistant message and drops everything after it                                                            |
+| Steering             | —                                              | `_session/steering` injects a follow-up into the running turn at its next step boundary; the client's open `session/prompt` keeps the turn, its output stream, and its stop reason                                                    |
+| Skills               | —                                              | the `@deepseek-ai/dsh-skill` registry's `userInvocable` entries join the same `available_commands_update` roster as the host commands, commands winning any name collision                                                            |
+
+## Fork, steering, and skills
+
+`session/fork` is advertised as `sessionCapabilities.fork`. Without an
+extension block in `_meta` it copies the source session's whole committed log
+into a new independent session and never touches the source. With
+`_meta.jetbrains.air.fork` (version 1, `inclusive`) the new session keeps the
+selected assistant message and everything before it. The message is named by
+`messageId` (`<turn>:<step>`, or a `<turn>:<step>:segment:<n>` segment id that
+resolves to the whole message), optionally pinned with
+`messageFingerprint` (`sha256:` + the SHA-256 of the assistant's visible text)
+and disambiguated by a 1-based `messageOccurrence`. Tool calls on the selected
+message are stripped from the copy, because their results are logged after it
+and keeping the calls alone would be an illegal transcript. A fork point that
+cannot be resolved is `invalidParams` — never a silent whole-session copy.
+
+A forked child is a platform fork seed (`isSeeded` plus the exact inherited
+prefix length) whose open tail `buildForkSeed` closes with `forked` results and
+step/turn endings, so it never inherits a half-open turn. Fork lineage sets
+`parentSession` but not `origin: 'subagent'`, which is what keeps the branch a
+first-class root: listable, loadable, resumable, and promptable. A fork
+inherits the conversation, not the route — forking a session pinned to a
+non-default model lands on the composition default, and the response carries
+the child's full `configOptions` so you can change it first.
+
+`_session/steering` is a custom extension method advertised as
+`_meta.steering.supported`. It adds one message to a turn that is already
+running, consumed at that turn's next step boundary, and answers
+`{ outcome: "injected" }` or
+`{ outcome: "promptRequired", reason: "noRunningTurn" }`. The bridge never
+starts a turn on the client's behalf: a turn with no waiting request would have
+no owner for its stop reason, cost, or output stream.
+
+Skills need no dispatch — `/skill-name` is the harness's own invocation
+gesture, so the bridge only adds discoverability by listing the registry's
+`userInvocable` entries. This plugin's bundle leaves the composition alone: in
+the default `zed` profile `skill-filesystem` and `tool-skill` are still
+disabled, so a deployment mounts a provider to see any skills.
 
 ## Turn statistics and cost
 
@@ -94,8 +135,8 @@ Malformed values are ignored with a logged warning. Cache writes bill at the mis
 
 ## Compatibility
 
-Peer ranges declare `~0.2.0-rc.1`: any dsh in the 0.2.x line from
-`0.2.0-rc.1` on is accepted; dsh's profile boot checks them at install and
+Peer ranges declare `~0.2.0-rc.2`: any dsh in the 0.2.x line from
+`0.2.0-rc.2` on is accepted; dsh's profile boot checks them at install and
 boot and names an incompatible plugin loudly. All `@deepseek-ai/*` modules
 load from the host installation — the plugin ships no runtime.
 

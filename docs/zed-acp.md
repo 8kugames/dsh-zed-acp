@@ -15,7 +15,7 @@ This tutorial connects the [Zed](https://zed.dev) editor to DeepSeek Harness ove
 Install the CLI pinned to the version the plugin targets, add the Zed ACP plugin to a profile, and register the profile in your Zed `settings.json`:
 
 ```sh
-npm install -g @deepseek-ai/dsh@0.2.0-rc.1
+npm install -g @deepseek-ai/dsh@0.2.0-rc.2
 dsh plugin --profile zed add "github:8kugames/dsh-zed-acp#zed-acp"
 ```
 
@@ -63,6 +63,39 @@ Sessions persist under the harness home, so the session history in Zed lists ear
 ## Watch background subagents
 
 When the agent delegates to a continuable subagent (`backgroundMode: continuable`), the spawned work outlives the tool call that started it, so the bridge keeps the turn open until every background descendant goes idle — the panel keeps its busy state instead of reporting the request as finished while work continues. Cancelling settles the turn promptly and leaves the still-running work visible as one synthetic tool card per activity period (`Background subagent`, in-progress while it runs). Reopening the session later replays each descendant's persisted fate from the child session's own log — interrupted or crashed work settles as `failed`, finished work as `completed` — so an interrupted delegation cannot pass as the early-settled spawn call's success. A descendant that wakes again after the turn fully settled only opens a new card; it does not reopen the finished turn.
+
+## Fork from a reply
+
+ACP `session/fork` copies an existing session into an independent new one and leaves the source completely untouched. When the client sends `_meta.jetbrains.air.fork` in the request (version 1, `inclusive`), the new session keeps the **selected assistant message and everything before it** and drops everything after it — which is exactly "branch from this reply".
+
+`messageId` is that message's ACP id (`<turn>:<step>`; a streamed segment id `<turn>:<step>:segment:<n>` also resolves to the whole message). If a reused counter makes an id point at a different message, pin it with `messageFingerprint` (`sha256:` plus the SHA-256 of the assistant's visible text); `messageOccurrence` (1-based) disambiguates a repeated fingerprint.
+
+Tool calls on the selected message are removed from the copied message: their results are recorded after it, so keeping the calls alone would be an illegal transcript and would let the child's `session/load` replay run past the fork point. Earlier calls and results are kept as they were.
+
+A fork point that cannot be found, a fingerprint that disagrees, or an unsupported version all return `invalidParams` — and never silently degrade into a whole-session copy, which would branch from the wrong place with nothing to notice.
+
+A forked child is a platform-native fork seed (`isSeeded` plus the exact inherited prefix length) with its open tail closed by `buildForkSeed`, so it never inherits a half-open turn and it is listable, reopenable, and promptable exactly like any other root session. A fork inherits the conversation, not route state: forking a session pinned to a non-default model lands on the composition default. The fork response carries the child's full `configOptions` so you can change it before prompting.
+
+## Steer a running turn
+
+While a `session/prompt` is in flight, a client can send the custom extension method `_session/steering` to add one more message to that same turn — no cancel-and-restart, and no second request. The message is consumed at the turn's next step boundary, and **the request that made the `session/prompt` still owns the turn**: its output stream and stop reason are unchanged.
+
+- `{ "outcome": "injected" }` — the message joined the running turn.
+- `{ "outcome": "promptRequired", "reason": "noRunningTurn" }` — there was no turn to join (no prompt started yet, or the turn already ended). The client sends an ordinary `session/prompt` in that case.
+
+The bridge only calls the agent's injection primitive when a turn is genuinely running; it never starts a turn on the client's behalf, because a turn with no waiting request would have no owner for its stop reason, its cost, or its output stream.
+
+One caveat: a model call still in flight has no step boundary yet, so a steered message waits in the inbox until the next one, and cancelling the turn in that window discards it. Content admission is the same path `session/prompt` takes, so a block this connection never advertised (an inline image, for instance) is refused there too.
+
+Support is advertised as `_meta.steering.supported` in `initialize`. A client that never sends `_session/steering` is unaffected.
+
+## Use skill slash commands
+
+When the deployment composes `@deepseek-ai/dsh-skill`, the bridge merges the registry's `userInvocable` skills into the slash-command roster (`available_commands_update`) alongside the host command registry's entries — and the command registry keeps a colliding name. The `modelInvocable` half is the model's, not yours, and stays out of the menu.
+
+A skill needs no dispatch from the bridge: typing `/skill-name` in a message is the harness's own invocation gesture, so what the bridge adds is discoverability. Listing reads summaries only, never a skill body.
+
+This plugin's bundle leaves the composition alone. In the default `zed` profile `skill-filesystem` (the local provider) and `tool-skill` (the model-facing tool) are still disabled, so a deployment has to mount a provider to see any skills. A failed catalog read only logs a warning; the command roster still ships.
 
 ## Serve self-configured models
 

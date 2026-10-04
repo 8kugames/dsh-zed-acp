@@ -11,13 +11,21 @@ type DescendantCardUpdate =
 
 let descendantSeq = 0
 
-/** Minimal lineage-bearing agent, the only shape the bridge's routing reads. */
+/**
+ * Minimal delegated agent, the only shape the bridge's routing reads: the
+ * spawn tool stamps both `parentSession` and `origin: 'subagent'` on a child,
+ * and the bridge requires the origin stamp so a fork-lineage session is never
+ * mistaken for delegated work.
+ */
 function fakeDescendant(parentSessionId: string): Agent {
   descendantSeq += 1
   const id = `descendant-${descendantSeq}`
   return {
     id,
-    session: { id: SessionId(id), header: { id: SessionId(id), parentSession: SessionId(parentSessionId) } },
+    session: {
+      id: SessionId(id),
+      header: { id: SessionId(id), parentSession: SessionId(parentSessionId), origin: 'subagent' },
+    },
   } as unknown as Agent
 }
 

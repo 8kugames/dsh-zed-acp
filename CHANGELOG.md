@@ -3,6 +3,30 @@
 本项目的所有显著变更都会记录在此文件。本格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.0] - 2026-10-04
+
+三项协议能力：分叉、转向、skills 目录。
+
+### 新增
+
+- `session/fork`：`initialize` 通告 `sessionCapabilities.fork`。不带扩展块时把源会话的整份已提交日志复制进一个新的独立会话，源会话完全不被改动；带 `_meta.jetbrains.air.fork`（版本 1，`inclusive`）时保留选中的助手回复及其之前的一切。消息由 `messageId`（`<turn>:<step>`，`<turn>:<step>:segment:<n>` 匹配整条消息）指定，可用 `messageFingerprint`（`sha256:` + 助手可见文本的 SHA-256）钉死、`messageOccurrence`（从 1 开始）消歧；id 命中但指纹不符视为未命中，使被重用的计数器无法选到另一条消息。选中消息上的工具调用从副本移除（其结果记录在消息之后，只留调用是非法转录，也会让子会话 `session/load` 回放越过分叉点），更早的调用与结果原样保留。分叉点无法解析、指纹不符、版本不支持一律 `invalidParams`，绝不静默退化成整会话复制。子会话是平台原生 fork 种子（`meta.isSeeded` + 精确 `inheritedEventCount`），开放尾部由 `buildForkSeed` 以 `forked` 结果与 step/turn 收尾补齐，因此不继承半开的回合。响应带回与 `session/new` 同形的 `modes` 与 `configOptions`。分叉继承对话而非路由：非默认模型上的会话分叉后落到组合默认模型，可先按响应改路由。
+
+- fork 血缘的委托门禁修正：`parentSession` 是平台的 fork 血缘字段，`session/fork` 子会话与 spawn 子会话带同一份 header 血缘，只有 spawn 工具额外盖 `origin: 'subagent'` 戳。此前 `session/list`、`session/resume`、`session/load` 以及实时后代路由一律以 `parentSession !== undefined` 判定 delegated，会把每个 fork 子会话挡成一等根之外、变成只写不可寻回的记录。现统一改判 `origin === 'subagent'`：分叉分支可列出、可重开、可继续对话，而真正的委派子会话仍照旧不可见。
+
+- `_session/steering`：自定义扩展方法，以 `initialize` 的 `_meta.steering.supported` 通告。向正在运行的回合追加一条消息，在该回合的下一个步骤边界被消费，客户端已打开的 `session/prompt` 仍持有该回合、其输出流与其 stop reason。回答 `{ outcome: "injected" }` 或 `{ outcome: "promptRequired", reason: "noRunningTurn" }`；没有运行中的回合时 bridge 绝不替客户端开启回合——没有请求在等的回合其 stop reason、费用归属与输出流都没有主人。内容准入与 `session/prompt` 同路（`admitAcpPrompt`），因此转向消息无法绕过连接的图片能力与路由校验。可 steer 的判据是「在飞 prompt 已认领回合、回合未结束、未被取消」；`settlementStarted` 不作为判据——它在 prompt 入队时即置位，因为结算在整个回合生命周期内持续等待静止。
+
+- skills 斜杠命令目录：部署组合 `@deepseek-ai/dsh-skill` 时，注册表中 `userInvocable` 的条目并入同一份 `available_commands_update`，排在宿主命令注册表条目之后，同名时命令注册表优先（它才是自己命名空间的权威）。`modelInvocable` 那一半属于模型侧，不进用户菜单。skill 无需 bridge 派发——消息里的 `/skill-name` 是 harness 自己的调用手势，bridge 补的只是可发现性；目录只读摘要不读正文。`availableCommandsUpdate` 因此从同步改为异步：命令目录的 tail 位置在 skill 目录读取开始前同步捕获，读取本身与该 drain 并行，投递仍排在调用时已入队的全部更新之后。新增可选 peer 依赖 `@deepseek-ai/dsh-skill`。目录读取失败只记 warn，命令目录照常送达。**本插件的 bundle 不改动组合**：默认 `zed` profile 下 `skill-filesystem` 与 `tool-skill` 仍禁用，部署方需自行挂载 provider 才看得到 skill。
+
+- `agentCapabilities._meta` 现在通告两个带命名空间与版本的扩展能力块（`steering`、`jetbrains.air.fork`）。标准路径保持完整：从不读取 `_meta` 的客户端仍拿到普通整会话 `session/fork`、不调用转向方法、拥有完整的会话/prompt/取消/认证/配置项契约。
+
+### 修复
+
+- 分叉活跃源会话会读到空日志：活跃会话的已提交事件在持久化屏障之前对读句柄不可见，而分叉的常见来源正是屏幕上正在进行的那个会话。现在 `AcpSession.fork` 在读取前对本进程内活跃的源会话执行 `ctx.sessions.flush`，否则分支会静默地从空对话分叉。
+
+### 变更
+
+- peer 依赖、开发依赖与直接依赖 `@deepseek-ai/dsh-brand` 从 `0.2.0-rc.1` 全面对齐到 `0.2.0-rc.2`，`registry/agent.json` 的运行时钉版与全部文档安装指引同步升至 dsh `0.2.0-rc.2`。经对全部 40 个 `@deepseek-ai/dsh-*` 包 rc.1/rc.2 的发布 tarball 全量对比，rc.2 无破坏性变更（CLI 的 Desktop 载体支持、`dsh-user-questions` 的 timed 问询、`dsh-tool-ask-user` 的可选 timed 模式均为向后兼容的增量，默认行为不变），插件源码零改动即完成对齐；typecheck 与全部 273 个测试在 rc.2 下直接通过。`THIRD_PARTY_NOTICES.md` 的 `dsh-brand` 版本行同步校正（此前停留在 `0.1.7-rc.2`）。
+
 ## [0.2.2] - 2026-09-29
 
 ### 新增
