@@ -4,7 +4,23 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { ToolCallId, MessageId } from '@deepseek-ai/dsh-llm'
 import { SessionSeq, type Session, type SessionEvent } from '@deepseek-ai/dsh-session'
 import type { TodoItem } from '@deepseek-ai/dsh-tool-todo'
-import { assistantUpdates, availableCommandsUpdate, currentModeUpdate, sessionTitleUpdate, todoPlanUpdate, toolCallUpdate, toolResultUpdate } from '../src/updates.ts'
+import {
+  DESCENDANT_ACTIVITY_TITLE,
+  DESCENDANT_STALL_WARN_MS,
+  assistantUpdates,
+  availableCommandsUpdate,
+  currentModeUpdate,
+  descendantActivityOpen,
+  descendantActivityProgress,
+  descendantActivitySettle,
+  descendantActivityTitle,
+  descendantProgressText,
+  sessionTitleUpdate,
+  todoPlanUpdate,
+  toolCallUpdate,
+  toolResultUpdate,
+  turnEndToFate,
+} from '../src/updates.ts'
 
 /** Minimal committed assistant event for pure update projection tests. */
 function assistantEvent(
@@ -30,6 +46,73 @@ function assistantEvent(
     },
   }
 }
+
+describe('descendant activity card projection', () => {
+  it('opens generic, patches the learned title, and keeps live patches status-less', () => {
+    expect(descendantActivityOpen('dsh-subagent-a-1', undefined).title).toBe(DESCENDANT_ACTIVITY_TITLE)
+    expect(descendantActivityOpen('dsh-subagent-a-1', 'Audit the parser').title).toBe('Audit the parser')
+    const title = descendantActivityTitle('dsh-subagent-a-1', 'Audit the parser')
+    expect(title.title).toBe('Audit the parser')
+    expect(title.status).toBeUndefined()
+    const progress = descendantActivityProgress('dsh-subagent-a-1', 'body')
+    expect(progress.status).toBeUndefined()
+    expect(progress.content).toEqual([{ type: 'content', content: { type: 'text', text: 'body' } }])
+  })
+
+  it('settles with fate and summary, defaulting to a bare completed', () => {
+    expect(descendantActivitySettle('dsh-subagent-a-1')).toEqual({
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'dsh-subagent-a-1',
+      status: 'completed',
+    })
+    const failed = descendantActivitySettle('dsh-subagent-a-1', 'failed', 'boom')
+    expect(failed.status).toBe('failed')
+    const block = failed.content?.[0]
+    expect(block).toMatchObject({ type: 'content', content: { type: 'text', text: 'boom' } })
+  })
+
+  it('renders activity, usage, and the stall warning only past the threshold', () => {
+    const active = descendantProgressText({
+      activity: 'npm test',
+      elapsedMs: 134_000,
+      silentMs: 1_000,
+      inputTokens: 1_100,
+      outputTokens: 50,
+    })
+    expect(active).toContain('`npm test`')
+    expect(active).toContain('elapsed 2m 14s')
+    expect(active).toContain('in 1.1k')
+    expect(active).toContain('out 50')
+    expect(active).not.toContain('stalled')
+    const stalled = descendantProgressText({
+      activity: undefined,
+      elapsedMs: 0,
+      silentMs: DESCENDANT_STALL_WARN_MS + 1,
+      inputTokens: undefined,
+      outputTokens: undefined,
+    })
+    expect(stalled).toContain('_working…_')
+    expect(stalled).toContain('stalled')
+    expect(stalled).not.toContain('in ')
+  })
+
+  it('keeps the activity code span intact when the activity itself contains backticks', () => {
+    const rendered = descendantProgressText({
+      activity: 'echo `date`',
+      elapsedMs: 1_000,
+      silentMs: 0,
+      inputTokens: undefined,
+      outputTokens: undefined,
+    })
+    expect(rendered.startsWith('`` ')).toBe(true)
+    expect(rendered).toContain('echo `date`')
+  })
+
+  it('maps turn-end kinds to delegated fate', () => {
+    for (const kind of ['completed', 'max-tokens', 'forked']) expect(turnEndToFate(kind)).toBe('completed')
+    for (const kind of ['interrupted', 'aborted', 'blocked', 'error']) expect(turnEndToFate(kind)).toBe('failed')
+  })
+})
 
 describe('standard ACP update projection', () => {
   /** Minimal committed tool-call event for pure update projection tests. */

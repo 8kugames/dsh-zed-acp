@@ -1,7 +1,7 @@
 {
   "name": "@8kugames/dsh-zed-acp",
   "description": "Zed-oriented Agent Client Protocol server for DeepSeek Harness: installable dsh plugin (`dsh plugin --profile zed add @8kugames/dsh-zed-acp`) exposing persistent sessions, inclusive session/fork, turn steering, plan mode, agent presets, permission presets, credential auth, questions, skills, and file diffs to Zed.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "private": false,
   "type": "module",
   "license": "MIT",

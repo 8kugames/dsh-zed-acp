@@ -47,24 +47,32 @@ import {
   formatStatsCard,
   statsCardTitle,
   statsMeta,
+  sumPromptTokens,
   type PriceTable,
   type SessionStats,
   type TurnStats,
 } from './stats.ts'
 import {
   DEFAULT_MODE_ID,
+  DESCENDANT_RECONCILE_MS,
   PLAN_MODE_ID,
   availableCommandsUpdate,
   assistantUpdates,
   contextUsage,
   currentModeUpdate,
   descendantActivityOpen,
+  descendantActivityProgress,
   descendantActivitySettle,
+  descendantActivityTitle,
   descendantHistoryFromEvents,
+  descendantProgressText,
+  oneLineText,
   sessionTitleUpdate,
   todoPlanUpdate,
+  toolCallTitle,
   toolCallUpdate,
   toolResultUpdate,
+  turnEndToFate,
   turnStatsCard,
   userMessageUpdates,
   type ProjectedToolCall,
@@ -122,6 +130,24 @@ interface ContinuableDrain {
  */
 type DescendantState = 'known' | 'running' | 'idle'
 
+/**
+ * One tracked descendant's observed facts, per activity period. The `agent`
+ * handle carries the mirrored `status` ground truth reconciliation re-reads;
+ * `title` survives across periods (the task text is session-scoped) while the
+ * remaining fields reset when a new period opens.
+ */
+interface DescendantFacts {
+  agent: Agent | undefined
+  title: string | undefined
+  activity: string | undefined
+  inputTokens: number
+  outputTokens: number
+  periodStartMs: number
+  lastEventMs: number
+  periodFate: 'completed' | 'failed' | undefined
+  summary: string | undefined
+}
+
 interface InflightPrompt {
   resolve: (reason: StopReason) => void
   reject: (error: Error) => void
@@ -137,6 +163,22 @@ interface InflightPrompt {
   outputError: Error | undefined
   agentError: Error | undefined
   stats: TurnStats | undefined
+}
+
+/** Open one descendant's tracking facts at birth or adoption. */
+function freshDescendantFacts(agent: Agent): DescendantFacts {
+  const now = Date.now()
+  return {
+    agent,
+    title: undefined,
+    activity: undefined,
+    inputTokens: 0,
+    outputTokens: 0,
+    periodStartMs: now,
+    lastEventMs: now,
+    periodFate: undefined,
+    summary: undefined,
+  }
 }
 
 /** Standard invalid-parameter failure with protocol-safe detail. */
@@ -191,6 +233,12 @@ export class AcpSession {
   private readonly openDescendantCards = new Map<string, string>()
   /** Activity-period counter per tracked descendant agent id (idle → running again opens a new card). */
   private readonly descendantPeriods = new Map<string, number>()
+  /** Observed facts per tracked descendant agent id, feeding progress cards and reconciliation. */
+  private readonly descendantFacts = new Map<string, DescendantFacts>()
+  /** Descendant session id → agent id, routing descendant `session/event`s to their tracked agent. */
+  private readonly descendantBySession = new Map<SessionId, string>()
+  /** Periodic reconciliation handle while any descendant is tracked; unref'd so it never holds the process. */
+  private descendantTimer: ReturnType<typeof setInterval> | undefined
   /** Resolvers released when the tracked descendants reach zero active or the prompt is cancelled. */
   private descendantWaiters: (() => void)[] = []
 
@@ -927,30 +975,96 @@ export class AcpSession {
    * @param agent - the newly created descendant Agent.
    */
   onDescendantBorn(agent: Agent): void {
+    if (this.closing !== undefined) return
     if (this.descendantStates.has(agent.id)) return
     this.descendantStates.set(agent.id, 'known')
+    this.descendantBySession.set(agent.session.id, agent.id)
+    this.descendantFacts.set(agent.id, freshDescendantFacts(agent))
     this.openDescendantCard(agent.id)
+    this.reconcileDescendants()
   }
 
   /**
    * Follow one tracked descendant's `agent/status` transition: `running`
-   * (re)opens an activity card, `idle` settles the open one.
+   * (re)opens an activity card, `idle` settles the open one. A status for an
+   * untracked descendant is adopted (with its facts, so reconciliation can
+   * re-read the handle) rather than dropped, so stray remaining activity still
+   * surfaces — and cannot wedge the gate, because the periodic reconcile
+   * settles any adoption the ground truth has already left behind.
    * @param agent - the transitioning descendant Agent.
    * @param status - the status just entered.
    */
   onDescendantStatus(agent: Agent, status: AgentStatus): void {
+    if (this.closing !== undefined) return
     const previous = this.descendantStates.get(agent.id)
     if (previous === status) return
-    // A status for an untracked descendant (an out-of-order event around
-    // disposal, or after a close drained the states) is adopted rather than
-    // dropped, so stray remaining activity still surfaces.
     this.descendantStates.set(agent.id, status)
+    if (!this.descendantFacts.has(agent.id)) {
+      this.descendantFacts.set(agent.id, freshDescendantFacts(agent))
+      this.descendantBySession.set(agent.session.id, agent.id)
+    }
     if (status === 'idle') {
       this.settleDescendantCard(agent.id)
     } else {
       this.openDescendantCard(agent.id)
+      this.refreshDescendantCard(agent.id)
     }
+    this.reconcileDescendants()
     if (this.activeDescendantCount() === 0) this.releaseDescendantWaiters()
+  }
+
+  /**
+   * Track one tracked descendant's committed session events into its open
+   * activity card: the first user message becomes the card title, tool calls
+   * and assistant lines become the live activity readout, usage accumulates,
+   * and the period's last `turn/end` decides its settle fate.
+   * @param session - the descendant's own session.
+   * @param event - one committed event from that session.
+   */
+  onDescendantSessionEvent(session: Session, event: SessionEvent): void {
+    if (this.closing !== undefined) return
+    const agentId = this.descendantBySession.get(session.header.id)
+    if (agentId === undefined) return
+    const facts = this.descendantFacts.get(agentId)
+    if (facts === undefined) return
+    facts.lastEventMs = Date.now()
+    if (event.type === 'user/message') {
+      if (facts.title === undefined) {
+        const title = oneLineText(event.data.content)
+        if (title !== undefined) {
+          facts.title = title
+          this.patchDescendantCardTitle(agentId, title)
+        }
+      }
+      this.reconcileDescendants()
+      return
+    }
+    if (event.type === 'tool/call') {
+      facts.activity = toolCallTitle(event.data.name, event.data.arguments)
+      this.refreshDescendantCard(agentId)
+      this.reconcileDescendants()
+      return
+    }
+    if (event.type === 'assistant/message') {
+      const line = oneLineText(event.data.message.content)
+      if (line !== undefined) {
+        facts.summary = line
+        facts.activity = line
+      }
+      const usage = event.data.usage
+      if (usage !== undefined) {
+        facts.inputTokens += sumPromptTokens(usage)
+        facts.outputTokens += usage.outputTokens
+      }
+      this.refreshDescendantCard(agentId)
+      this.reconcileDescendants()
+      return
+    }
+    if (event.type === 'turn/end') {
+      facts.periodFate = turnEndToFate(event.data.reason.kind)
+      this.refreshDescendantCard(agentId)
+      this.reconcileDescendants()
+    }
   }
 
   /**
@@ -962,9 +1076,16 @@ export class AcpSession {
   onDescendantGone(agent: Agent): void {
     this.settleDescendantCard(agent.id)
     this.descendantStates.delete(agent.id)
-    // The period counter stays monotonic across disposal: a same-id recreation
-    // (session resume) or a late status must never reuse a settled card id.
-    if (this.activeDescendantCount() === 0) this.releaseDescendantWaiters()
+    this.descendantFacts.delete(agent.id)
+    this.descendantBySession.delete(agent.session.id)
+    // Facts/period counter notes: the counter stays monotonic across disposal
+    // (a same-id recreation or late status must never reuse a settled card id)
+    // and the timer disarms once nothing is actively held — an idle-but-alive
+    // descendant must not keep the reconcile tick spinning.
+    if (this.activeDescendantCount() === 0) {
+      this.stopDescendantTimer()
+      this.releaseDescendantWaiters()
+    }
   }
 
   /** Await every update queued before this call. */
@@ -1021,7 +1142,11 @@ export class AcpSession {
     const modelId = this.modelControl.snapshot()?.model
     const updates: SessionUpdate[] = turnStatsCard(
       `dsh-stats-${stats.turn}`,
-      statsCardTitle(modelId),
+      statsCardTitle(modelId, {
+        inputTokens: sumPromptTokens(stats.usage),
+        outputTokens: stats.usage.outputTokens,
+        cost: stats.cost,
+      }),
       formatStatsCard(stats, this.sessionStats, modelId),
     )
     const usage = contextUsage(this.ctx, this.agent.session)
@@ -1081,6 +1206,9 @@ export class AcpSession {
       for (const agentId of [...this.openDescendantCards.keys()]) this.settleDescendantCard(agentId)
       this.descendantStates.clear()
       this.descendantPeriods.clear()
+      this.descendantFacts.clear()
+      this.descendantBySession.clear()
+      this.stopDescendantTimer()
       this.releaseDescendantWaiters()
       try {
         await this.ctx.sessions.flush(this.agent.session)
@@ -1133,19 +1261,33 @@ export class AcpSession {
 
   /**
    * Open this agent's current activity card, one synthetic `tool_call` per
-   * activity period riding the ordered update tail.
+   * activity period riding the ordered update tail. Period-scoped facts reset
+   * here; the learned title survives, so a re-woken descendant's new card opens
+   * already named.
    */
   private openDescendantCard(agentId: string): void {
     if (this.openDescendantCards.has(agentId)) return
+    this.ensureDescendantTimer()
     const period = (this.descendantPeriods.get(agentId) ?? 0) + 1
     this.descendantPeriods.set(agentId, period)
     const toolCallId = `dsh-subagent-${agentId}-${period}`
     this.openDescendantCards.set(agentId, toolCallId)
+    const facts = this.descendantFacts.get(agentId)
+    if (facts !== undefined) {
+      const now = Date.now()
+      facts.activity = undefined
+      facts.inputTokens = 0
+      facts.outputTokens = 0
+      facts.periodStartMs = now
+      facts.lastEventMs = now
+      facts.periodFate = undefined
+      facts.summary = undefined
+    }
     const previous = this.outputTail
     this.outputTail = previous
       .then(() => this.notify({
         sessionId: this.agent.session.id,
-        update: descendantActivityOpen(toolCallId),
+        update: descendantActivityOpen(toolCallId, facts?.title),
       }))
       /* v8 ignore start -- the bridge notifier contains transport rejection. */
       .catch((error: unknown) => {
@@ -1154,22 +1296,116 @@ export class AcpSession {
     /* v8 ignore stop */
   }
 
-  /** Settle this agent's open activity card, if any, on the ordered update tail. */
+  /** Settle this agent's open activity card with its observed fate and summary. */
   private settleDescendantCard(agentId: string): void {
     const toolCallId = this.openDescendantCards.get(agentId)
     if (toolCallId === undefined) return
     this.openDescendantCards.delete(agentId)
+    const facts = this.descendantFacts.get(agentId)
     const previous = this.outputTail
     this.outputTail = previous
       .then(() => this.notify({
         sessionId: this.agent.session.id,
-        update: descendantActivitySettle(toolCallId),
+        update: descendantActivitySettle(toolCallId, facts?.periodFate ?? 'completed', facts?.summary),
       }))
       /* v8 ignore start -- the bridge notifier contains transport rejection. */
       .catch((error: unknown) => {
         this.ctx.logger.warn(`acp: descendant-activity settle delivery failed: ${errorChain(error)}`)
       })
     /* v8 ignore stop */
+  }
+
+  /** Replace one open card's body with the latest progress snapshot. */
+  private refreshDescendantCard(agentId: string): void {
+    const toolCallId = this.openDescendantCards.get(agentId)
+    if (toolCallId === undefined) return
+    const facts = this.descendantFacts.get(agentId)
+    if (facts === undefined) return
+    const now = Date.now()
+    const sawUsage = facts.inputTokens > 0 || facts.outputTokens > 0
+    const text = descendantProgressText({
+      activity: facts.activity,
+      elapsedMs: now - facts.periodStartMs,
+      silentMs: now - facts.lastEventMs,
+      inputTokens: sawUsage ? facts.inputTokens : undefined,
+      outputTokens: sawUsage ? facts.outputTokens : undefined,
+    })
+    const previous = this.outputTail
+    this.outputTail = previous
+      .then(() => this.notify({
+        sessionId: this.agent.session.id,
+        update: descendantActivityProgress(toolCallId, text),
+      }))
+      /* v8 ignore start -- the bridge notifier contains transport rejection. */
+      .catch((error: unknown) => {
+        this.ctx.logger.warn(`acp: descendant-activity progress delivery failed: ${errorChain(error)}`)
+      })
+    /* v8 ignore stop */
+  }
+
+  /** Patch one open card's title after the descendant's task text commits. */
+  private patchDescendantCardTitle(agentId: string, title: string): void {
+    const toolCallId = this.openDescendantCards.get(agentId)
+    if (toolCallId === undefined) return
+    const previous = this.outputTail
+    this.outputTail = previous
+      .then(() => this.notify({
+        sessionId: this.agent.session.id,
+        update: descendantActivityTitle(toolCallId, title),
+      }))
+      /* v8 ignore start -- the bridge notifier contains transport rejection. */
+      .catch((error: unknown) => {
+        this.ctx.logger.warn(`acp: descendant-activity title delivery failed: ${errorChain(error)}`)
+      })
+    /* v8 ignore stop */
+  }
+
+  /**
+   * Reconcile tracked states against the agents' mirrored `status` ground
+   * truth and refresh open cards' elapsed/stall readout. Runs on every
+   * descendant input and on the {@link DESCENDANT_RECONCILE_MS} interval, so a
+   * wedged `known`/`running` entry whose agent already went idle — a missed
+   * terminal event, or a stray post-disposal adoption — settles here instead of
+   * holding the descendant gate forever. A descendant whose ground truth is
+   * genuinely still `running` stays held: the agreed semantics keep background
+   * work from masquerading as a finished turn, and cancellation remains the
+   * only forced exit. The timer stops once nothing is tracked.
+   * ponytail: a driver that died without disposal while its mirrored `status`
+   * stays frozen at `running` is indistinguishable from a genuinely hung tool
+   * call through the public event surface; both surface as a stalled card and
+   * yield to cancellation.
+   */
+  private reconcileDescendants(): void {
+    for (const [agentId, state] of this.descendantStates) {
+      if (state === 'idle') continue
+      const agent = this.descendantFacts.get(agentId)?.agent
+      if (agent === undefined || agent.status !== 'idle') continue
+      this.descendantStates.set(agentId, 'idle')
+      this.ctx.logger.warn(`acp: descendant ${agentId} observed ${state} but agent reports idle; reconciled`)
+      this.settleDescendantCard(agentId)
+    }
+    if (this.activeDescendantCount() === 0) {
+      this.stopDescendantTimer()
+      this.releaseDescendantWaiters()
+    }
+  }
+
+  /** Arm the periodic reconciliation timer while descendants are tracked; the
+   * tick adds an open-card readout refresh on top of the state pass. */
+  private ensureDescendantTimer(): void {
+    if (this.descendantTimer !== undefined) return
+    this.descendantTimer = setInterval(() => {
+      this.reconcileDescendants()
+      for (const agentId of this.openDescendantCards.keys()) this.refreshDescendantCard(agentId)
+    }, DESCENDANT_RECONCILE_MS)
+    this.descendantTimer.unref?.()
+  }
+
+  /** Disarm the periodic reconciliation timer. */
+  private stopDescendantTimer(): void {
+    if (this.descendantTimer === undefined) return
+    clearInterval(this.descendantTimer)
+    this.descendantTimer = undefined
   }
 
   private assertActive(): void {

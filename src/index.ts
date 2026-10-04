@@ -221,9 +221,24 @@ export function apply(ctx: Context, config: AcpConfig): void {
     /* v8 ignore stop */
   }
 
+  // Continuable-subagent visibility: descendant agents (header lineage) route
+  // to their root ACP session, which holds its prompt open while they work and
+  // projects each activity period as a synthetic card. The lineage map covers
+  // grandchildren transitively: a child's own children resolve through the
+  // child's entry, mirroring the recursive descendant drain. Declared before
+  // the `session/event` handler below, which falls back to it for descendant
+  // sessions (their committed events feed the live progress cards).
+  const descendantRoots = new Map<SessionId, AcpSession>()
+  const recordOwningSession = (sessionId: SessionId): AcpSession | undefined =>
+    descendantRoots.get(sessionId) ?? sessions.get(sessionId)
+
   ctx.on('session/event', (session, event) => {
     const record = sessions.get(session.header.id)
-    if (record?.ownsSession(session) === true) record.onSessionEvent(session, event)
+    if (record !== undefined) {
+      if (record.ownsSession(session)) record.onSessionEvent(session, event)
+      return
+    }
+    descendantRoots.get(session.header.id)?.onDescendantSessionEvent(session, event)
   })
 
   ctx.on('agent/inbox/claimed', ({ agent, message, turn }) => {
@@ -244,14 +259,6 @@ export function apply(ctx: Context, config: AcpConfig): void {
     for (const record of sessions.values()) record.publishAvailableCommands()
   })
 
-  // Continuable-subagent visibility: descendant agents (header lineage) route
-  // to their root ACP session, which holds its prompt open while they work and
-  // projects each activity period as a synthetic card. The lineage map covers
-  // grandchildren transitively: a child's own children resolve through the
-  // child's entry, mirroring the recursive descendant drain.
-  const descendantRoots = new Map<SessionId, AcpSession>()
-  const recordOwningSession = (sessionId: SessionId): AcpSession | undefined =>
-    descendantRoots.get(sessionId) ?? sessions.get(sessionId)
   ctx.on('agent/created', ({ agent }) => {
     const parent = agent.session.header.parentSession
     if (parent === undefined || !isDelegatedChild(agent.session.header)) return

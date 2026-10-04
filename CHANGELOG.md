@@ -1,7 +1,25 @@
 # 更新日志
 
-本项目的所有显著变更都会记录在此文件。本格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
-本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+本项目的所有显著变更都会记录在此文件。本格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0)，
+本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
+
+## [0.3.1] - 2026-10-04
+
+后台子代理进度卡片、回收对账加固与 Turn stats 标题栏常显摘要。
+
+### 新增
+
+- continuable 子代理活动卡升级为进度卡：开卡仍为通用标题，子代理首条用户消息提交后即以任务文本补丁替换标题（`tool_call_update` 的 patch 语义，仅改 title）；卡片正文随子会话已提交事件实时整卡替换（content 替换语义、status 保持 in_progress）——当前工具活动（复用工具卡标题提取）/最新助手输出行、累计输入/输出 token（含缓存桶）、活动期耗时，以及超过 `DESCENDANT_STALL_WARN_MS`（两分钟）无事件后的 `stalled` 告警行。活动期结束时按子代理自身最后一次 `turn/end` 保真结算（completed/max-tokens/forked → `completed`，interrupted/aborted/blocked/error → `failed`，无 fate 默认 `completed` 维持旧行为），并携带其最后一条助手单行摘要；fate 映射从 reload 投影器提取为共享的 `turnEndToFate`，live 与 reload 永不分歧。ponytail：若任务消息作为会话构造 seed 提交（seed 事件不发 `session/event`），live 标题保持通用名，reload 仍能从持久日志学到任务文本。
+
+- 后代事件路由：`session/event` 处理器在直连会话未命中时回落 `descendantRoots` 血缘路由，把子会话已提交事件喂给根会话的进度卡；收养迟 status 时同步登记事实与 agent 句柄。
+
+- 回收对账加固：新增 `reconcileDescendants` 对账通道，由每次后代输入（born/status/session 事件）与 `DESCENDANT_RECONCILE_MS`（15 秒，unref）定时器双路驱动——逐个重读 agent 镜像 `status`，状态表非 idle 而真值已 idle 的项立即结算并记结构化 warn，同时刷新开卡的正文读数（耗时/停滞）；状态表清空即停定时器，`close` 同步清理全部后代追踪状态。终结了两个卡死路径：漏掉终态事件的 `known`/`running` 项永久持有结算门控，以及 disposal 后迟到 `running` 被收养后永无终态事件可清。真实仍在运行的后代按既定语义继续被持有（不引入强制超时释放），取消仍是唯一强制出口；活跃后代清零即停定时器（idle 留存项不再空转，running 重开时自动重臂），born/status 入口带 closing 守卫堵住 close 后迟事件的复活口；驱动死亡且镜像冻结在 running 的极端情形公开事件面不可区分于真实挂起，由停滞告警暴露。ponytail 已标明该天花板。
+
+- Turn stats 卡片标题栏常显摘要：折叠可见的 title 行从 `Turn stats · <model>` 升级为 `Turn stats · <model> · in 45.2k / out 1.2k · $0.0123`，价表外模型（如自定义网关路由）显示 `unpriced` 而非静默省略 cost 段——因为展开与否是客户端单方决定，ACP 无展开控制字段。正文统计卡内容与 `usage_update`/`dsh._meta` 口径不变；新增 `formatTokenCount` 紧凑格式化。
+
+### 变更
+
+- 后代事件面导出调整：`toolCallTitle`/`oneLineText` 从 `src/updates.ts` 导出供进度卡复用；`descendantActivityOpen` 增加可选 title 参数、`descendantActivitySettle` 增加 outcome/summary 参数（默认值保持旧调用形状）。
 
 ## [0.3.0] - 2026-10-04
 

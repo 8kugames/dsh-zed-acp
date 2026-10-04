@@ -5,6 +5,8 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { SESSION_FORMAT_VERSION, SessionId, SessionSeq, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
 import { makeBridgeHarness, textResponse, type BridgeHarness } from './harness.ts'
 
+import { DESCENDANT_ACTIVITY_TITLE } from '../src/updates.ts'
+
 type DescendantCardUpdate =
   | Extract<SessionUpdate, { sessionUpdate: 'tool_call' }>
   | Extract<SessionUpdate, { sessionUpdate: 'tool_call_update' }>
@@ -25,6 +27,10 @@ function fakeDescendant(parentSessionId: string): Agent {
     session: {
       id: SessionId(id),
       header: { id: SessionId(id), parentSession: SessionId(parentSessionId), origin: 'subagent' },
+      // The shared `session/event` emit also reaches the harness's projection
+      // registry, whose eager drive folds `snapshotEvents` on first contact.
+      inheritedEventCount: 0,
+      snapshotEvents: () => [],
     },
   } as unknown as Agent
 }
@@ -35,7 +41,11 @@ function descendantCards(harness: BridgeHarness, sessionId: string, stage: 'tool
     if (sid !== sessionId) continue
     if (update.sessionUpdate === 'tool_call' && stage === 'tool_call' && update.toolCallId.startsWith('dsh-subagent-')) {
       cards.push(update)
-    } else if (update.sessionUpdate === 'tool_call_update' && stage === 'tool_call_update' && update.toolCallId.startsWith('dsh-subagent-')) {
+    } else if (
+      update.sessionUpdate === 'tool_call_update' && stage === 'tool_call_update'
+      && update.status !== undefined && update.toolCallId.startsWith('dsh-subagent-')
+    ) {
+      // Live progress/title patches carry no `status`; only settling updates do.
       cards.push(update)
     }
   }
@@ -193,7 +203,172 @@ describe('descendant history reload projection', () => {
   })
 })
 
- describe('continuable-descendant visibility', () => {
+describe('descendant progress cards', () => {
+  let harness: BridgeHarness | undefined
+
+  afterEach(async () => {
+    await harness?.dispose()
+    harness = undefined
+  })
+
+  /** Committed child-session events driving one live progress card. */
+  function childUserMessage(text: string): SessionEvent {
+    return {
+      type: 'user/message',
+      seq: 1 as never,
+      time: Date.now(),
+      data: { id: 'u1', content: [{ type: 'text', text }], source: { kind: 'user' } },
+    } as unknown as SessionEvent
+  }
+
+  function childToolCall(): SessionEvent {
+    return {
+      type: 'tool/call',
+      seq: 2 as never,
+      time: Date.now(),
+      data: { turn: 1, step: 0, callId: 'c1' as never, name: 'bash', arguments: JSON.stringify({ command: 'npm test' }) },
+    } as unknown as SessionEvent
+  }
+
+  function childAssistantMessage(): SessionEvent {
+    return {
+      type: 'assistant/message',
+      seq: 3 as never,
+      time: Date.now(),
+      data: {
+        turn: 1,
+        step: 0,
+        stream: [],
+        message: { id: 'm1', role: 'assistant', content: [{ type: 'text', text: 'Found the bug' }] },
+        usage: { inputTokens: 1_000, outputTokens: 50, cacheReadTokens: 100 },
+      },
+    } as unknown as SessionEvent
+  }
+
+  function childTurnEnd(kind: string): SessionEvent {
+    return { type: 'turn/end', seq: 4 as never, time: Date.now(), data: { turn: 1, reason: { kind } } } as unknown as SessionEvent
+  }
+
+  /** Live progress/title patches: `dsh-subagent-*` updates that carry no status. */
+  function descendantPatches(harness: BridgeHarness, sessionId: string): DescendantCardUpdate[] {
+    const patches: DescendantCardUpdate[] = []
+    for (const { sessionId: sid, update } of harness.sessionUpdates) {
+      if (sid !== sessionId || update.sessionUpdate !== 'tool_call_update') continue
+      if (!update.toolCallId.startsWith('dsh-subagent-')) continue
+      if (update.status === undefined) patches.push(update)
+    }
+    return patches
+  }
+
+  function patchText(update: DescendantCardUpdate): string {
+    const content = 'content' in update ? update.content : undefined
+    const block = content?.find(candidate => candidate.type === 'content') as
+      { content?: { type?: string; text?: string } } | undefined
+    return block?.content?.type === 'text' ? block.content.text ?? '' : ''
+  }
+
+  it('learns the task title and streams live progress into the open card', async () => {
+    harness = await makeBridgeHarness({ script: [textResponse('parent done')] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const prompt = harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] })
+    const child = fakeDescendant(sessionId)
+    await harness.ctx.emit('agent/created', { agent: child, source: 'startup' })
+    await harness.ctx.emit('agent/status', { agent: child, status: 'running' })
+    await harness.ctx.emit('session/event', child.session, childUserMessage('Audit the parser'))
+    await harness.ctx.emit('session/event', child.session, childToolCall())
+    await harness.ctx.emit('session/event', child.session, childAssistantMessage())
+    await harness.ctx.emit('session/event', child.session, childTurnEnd('completed'))
+    await harness.ctx.emit('agent/status', { agent: child, status: 'idle' })
+    const result = await prompt
+    expect(result.stopReason).toBe('end_turn')
+    // The card opens generic; the first committed user message patches its title.
+    const opened = descendantCards(harness, sessionId, 'tool_call')
+    expect(opened[0]!.title).toBe(DESCENDANT_ACTIVITY_TITLE)
+    const patches = descendantPatches(harness, sessionId)
+    expect(patches.some(update => update.title === 'Audit the parser')).toBe(true)
+    // The live body carried the tool activity and the accumulated token facts.
+    expect(patches.map(patchText).some(text => text.includes('`npm test`'))).toBe(true)
+    expect(patches.map(patchText).some(text => text.includes('in 1.1k'))).toBe(true)
+    // The settle follows the child's own turn fate and carries its last line.
+    const settled = descendantCards(harness, sessionId, 'tool_call_update')
+    expect(settled).toHaveLength(1)
+    expect(settled[0]!.status).toBe('completed')
+    expect(patchText(settled[0]!)).toBe('Found the bug')
+  })
+
+  it('settles a failed card from the child\'s error turn/end', async () => {
+    harness = await makeBridgeHarness({ script: [textResponse('parent done')] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const prompt = harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] })
+    const child = fakeDescendant(sessionId)
+    await harness.ctx.emit('agent/created', { agent: child, source: 'startup' })
+    await harness.ctx.emit('agent/status', { agent: child, status: 'running' })
+    await harness.ctx.emit('session/event', child.session, childAssistantMessage())
+    await harness.ctx.emit('session/event', child.session, childTurnEnd('error'))
+    await harness.ctx.emit('agent/status', { agent: child, status: 'idle' })
+    await prompt
+    const settled = descendantCards(harness, sessionId, 'tool_call_update')
+    expect(settled).toHaveLength(1)
+    expect(settled[0]!.status).toBe('failed')
+    expect(patchText(settled[0]!)).toBe('Found the bug')
+  })
+
+  it('reconciles a stale running state against the mirrored agent status', async () => {
+    harness = await makeBridgeHarness({ script: [textResponse('parent done')] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    let settled = false
+    const prompt = harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] })
+      .then(result => { settled = true; return result })
+    const child = fakeDescendant(sessionId)
+    await harness.ctx.emit('agent/created', { agent: child, source: 'startup' })
+    await harness.ctx.emit('agent/status', { agent: child, status: 'running' })
+    // The terminal idle never arrives (the wedge this reconciliation exists
+    // for); the agent's mirrored status ground truth moves on without us.
+    ;(child as unknown as { status: string }).status = 'idle'
+    // Any later descendant input drives the reconciliation pass, so the gate
+    // cannot stay wedged on the stale entry.
+    const sibling = fakeDescendant(sessionId)
+    await harness.ctx.emit('agent/created', { agent: sibling, source: 'startup' })
+    await new Promise(resolve => setImmediate(resolve))
+    expect(settled).toBe(false)
+    await harness.ctx.emit('agent/status', { agent: sibling, status: 'idle' })
+    const result = await prompt
+    expect(result.stopReason).toBe('end_turn')
+    const settledCards = descendantCards(harness, sessionId, 'tool_call_update')
+    expect(settledCards.map(update => update.status)).toEqual(['completed', 'completed'])
+  })
+
+  it('reconciles from the periodic timer when no descendant input arrives', async () => {
+    harness = await makeBridgeHarness({ script: [textResponse('parent done')] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    // Fake only the reconciliation interval: the parent turn's streaming and
+    // the harness's waits keep their real timers.
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    try {
+      const prompt = harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] })
+      const child = fakeDescendant(sessionId)
+      await harness.ctx.emit('agent/created', { agent: child, source: 'startup' })
+      await harness.ctx.emit('agent/status', { agent: child, status: 'running' })
+      await vi.waitFor(() => {
+        expect(harness!.updates.some(update => update.sessionUpdate === 'agent_message_chunk')).toBe(true)
+      })
+      // The terminal idle is lost; only the mocked 15s tick can reconcile.
+      ;(child as unknown as { status: string }).status = 'idle'
+      await vi.advanceTimersByTimeAsync(15_000)
+      const result = await prompt
+      expect(result.stopReason).toBe('end_turn')
+      expect(descendantCards(harness, sessionId, 'tool_call_update')).toHaveLength(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('continuable-descendant visibility', () => {
   let harness: BridgeHarness | undefined
 
   afterEach(async () => {

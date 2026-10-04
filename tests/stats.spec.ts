@@ -12,11 +12,13 @@ import {
   emptySessionStats,
   foldTurnStats,
   formatStatsCard,
+  formatTokenCount,
   isPeakUtcTime,
   mergePriceOverrides,
   parsePriceOverrides,
   priceUsage,
   resolvePrice,
+  statsCardTitle,
   statsMeta,
   type SessionStats,
   type TurnStats,
@@ -372,5 +374,33 @@ describe('formatStatsCard', () => {
     const session: SessionStats = foldTurnStats(emptySessionStats(), turn)
 
     expect(formatStatsCard(turn, session, undefined)).toContain('turn 1.5000 EUR · session 1.5000 EUR')
+  })
+})
+
+describe('collapsed title strip summary', () => {
+  it('carries compact usage and priced cost without expansion', () => {
+    expect(statsCardTitle('deepseek-flash', {
+      inputTokens: 45_200,
+      outputTokens: 1_234,
+      cost: { amount: 0.0123, currency: 'USD' },
+    })).toBe('Turn stats · deepseek-flash · in 45.2k / out 1.2k · $0.0123')
+  })
+
+  it('names unpriced models instead of silently dropping the cost segment', () => {
+    expect(statsCardTitle('glm-5.3-flash', { inputTokens: 980, outputTokens: 42, cost: undefined }))
+      .toBe('Turn stats · glm-5.3-flash · in 980 / out 42 · unpriced')
+    expect(statsCardTitle(undefined)).toBe('Turn stats')
+    expect(statsCardTitle('deepseek-flash')).toBe('Turn stats · deepseek-flash')
+  })
+
+  it('formats token counts compactly across scales', () => {
+    expect(formatTokenCount(0)).toBe('0')
+    expect(formatTokenCount(980)).toBe('980')
+    expect(formatTokenCount(45_200)).toBe('45.2k')
+    expect(formatTokenCount(150_000)).toBe('150k')
+    expect(formatTokenCount(1_234_567)).toBe('1.2M')
+    expect(formatTokenCount(999_950)).toBe('1M')
+    expect(formatTokenCount(999_950_000)).toBe('1B')
+    expect(formatTokenCount(250_000_000)).toBe('250M')
   })
 })

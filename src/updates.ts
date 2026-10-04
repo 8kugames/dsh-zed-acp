@@ -2,6 +2,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { formatTokenCount } from './stats.ts'
 import type {
   AvailableCommand,
   PlanEntry,
@@ -112,7 +113,7 @@ const SALIENT_TITLE_FIELDS = ['command', 'code', 'pattern', 'url', 'file_path', 
  * @param rawArguments - raw `arguments` JSON string exactly as the model produced it.
  * @returns the salient argument text when recognizable, otherwise the tool name.
  */
-function toolCallTitle(name: string, rawArguments: string): string {
+export function toolCallTitle(name: string, rawArguments: string): string {
   const parsed = parseToolArguments(rawArguments)
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return name
   const args = parsed as Record<string, unknown>
@@ -415,47 +416,158 @@ export function turnStatsCard(
 /** Fixed card title for one live continuable-subagent activity period. */
 export const DESCENDANT_ACTIVITY_TITLE = 'Background subagent'
 
+/** How long one activity period may stay event-silent before the progress card says so. */
+export const DESCENDANT_STALL_WARN_MS = 120_000
+
+/** Reconciliation cadence while any descendant is tracked: re-reads the agents'
+ * mirrored `status` and refreshes elapsed/stall lines on open cards. */
+export const DESCENDANT_RECONCILE_MS = 15_000
+
+/** Map one durable `turn/end` reason to delegated-task fate, shared by the live
+ * settle path and the reload fate projector so the two can never disagree. */
+export function turnEndToFate(kind: string): 'completed' | 'failed' {
+  return kind === 'completed' || kind === 'max-tokens' || kind === 'forked' ? 'completed' : 'failed'
+}
+
+/** Facts one open activity card renders between its opening and its settle. */
+export interface DescendantProgress {
+  /** Latest tool-call title or assistant one-liner, when anything ran yet. */
+  activity: string | undefined
+  /** Wall time since this activity period opened. */
+  elapsedMs: number
+  /** Wall time since the descendant's last committed event. */
+  silentMs: number
+  /** Prompt tokens accumulated by the descendant, once any call reported usage. */
+  inputTokens: number | undefined
+  outputTokens: number | undefined
+}
+
+/** Compact elapsed-time rendering for progress lines: `42s`, `2m 14s`, `1h 05m`. */
+function formatElapsed(ms: number): string {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000))
+  if (totalSeconds < 60) return `${totalSeconds}s`
+  const minutes = Math.floor(totalSeconds / 60)
+  if (minutes < 60) return `${minutes}m ${String(totalSeconds % 60).padStart(2, '0')}s`
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m`
+}
+
+/**
+ * Wrap one activity line as a markdown code span that survives embedded
+ * backticks: the delimiter is one longer than the text's longest backtick run,
+ * with padding spaces, per CommonMark. Without this, a command like
+ * `` echo `date` `` would close the span early and smear the remainder into
+ * the rendered card body.
+ */
+function codeSpan(text: string): string {
+  let longest = 0
+  for (const match of text.matchAll(/`+/g)) longest = Math.max(longest, match[0].length)
+  if (longest === 0) return `\`${text}\``
+  const delim = '`'.repeat(longest + 1)
+  return `${delim} ${text} ${delim}`
+}
+
+/**
+ * Render one activity period's live progress snapshot as the card body text.
+ * The card title carries the task; this body replaces wholesale on every
+ * update (`tool_call_update` patch semantics), so it stays a two-to-three-line
+ * "latest fact" readout rather than an append-only log.
+ */
+export function descendantProgressText(progress: DescendantProgress): string {
+  const lines: string[] = []
+  lines.push(progress.activity === undefined ? '_working…_' : codeSpan(progress.activity))
+  const meta = [`elapsed ${formatElapsed(progress.elapsedMs)}`]
+  if (progress.inputTokens !== undefined && progress.outputTokens !== undefined) {
+    meta.push(`in ${formatTokenCount(progress.inputTokens)}`, `out ${formatTokenCount(progress.outputTokens)}`)
+  }
+  lines.push(meta.join(' · '))
+  if (progress.silentMs >= DESCENDANT_STALL_WARN_MS) {
+    lines.push('', `**stalled** — no events for ${formatElapsed(progress.silentMs)}`)
+  }
+  return lines.join('\n')
+}
+
 /**
  * Open one continuable-subagent activity period as a synthetic tool card on the
  * parent session: `in_progress` from the descendant agent's creation until
  * that activity period ends (idle or disposed). Like the turn-statistics card
  * it never enters the durable DSH session, so a reloaded client does not
  * replay it; the deferred reload projector for descendant history reuses this
- * constructor against persisted descendant logs.
- * ponytail: the title is fixed rather than derived from the descendant's task
- * text — correlating a spawn with its parent `subagent` tool call's
- * `description` is temporal-adjacency guessing under parallel spawns. Upgrade
- * path: title from the descendant session's own durable first user message.
+ * constructor against persisted descendant logs. The title starts generic and
+ * is patched to the descendant's own first user message once that commits.
+ * ponytail: before the first `user/message` the task text is unknown — the
+ * spawn correlation is temporal-adjacency guessing under parallel spawns.
  * @param toolCallId - bridge-owned synthetic id, unique per activity period.
+ * @param title - learned task title when the descendant already surfaced one.
  * @returns the opening `tool_call` update.
  */
 export function descendantActivityOpen(
   toolCallId: string,
+  title: string | undefined,
 ): Extract<SessionUpdate, { sessionUpdate: 'tool_call' }> {
   return {
     sessionUpdate: 'tool_call',
     toolCallId,
-    title: DESCENDANT_ACTIVITY_TITLE,
+    title: title === undefined || title.length === 0 ? DESCENDANT_ACTIVITY_TITLE : title,
     kind: 'other',
     status: 'in_progress',
   }
 }
 
 /**
- * Settle one open descendant-activity card as `completed`.
- * ponytail: settles bare without a result body — summarizing the activity
- * would need the descendant session's assistant tail, which the parent-side
- * event surface does not carry. Upgrade path shared with the reload projector.
- * @param toolCallId - the same bridge-owned synthetic id.
- * @returns the settling `tool_call_update`.
+ * Patch one open card's title (patch semantics: a lone `title` field changes
+ * nothing else), used when the descendant's first user message commits after
+ * the activity period already opened.
+ * @param toolCallId - the open card's bridge-owned synthetic id.
+ * @param title - the learned task title.
+ * @returns the title-only `tool_call_update`.
  */
-export function descendantActivitySettle(
+export function descendantActivityTitle(
   toolCallId: string,
+  title: string,
+): Extract<SessionUpdate, { sessionUpdate: 'tool_call_update' }> {
+  return { sessionUpdate: 'tool_call_update', toolCallId, title }
+}
+
+/**
+ * Replace one open card's body with the latest progress snapshot. `status` is
+ * deliberately omitted (patch semantics), so the card stays `in_progress` and
+ * only its content moves.
+ * @param toolCallId - the open card's bridge-owned synthetic id.
+ * @param text - the rendered snapshot, from {@link descendantProgressText}.
+ * @returns the content-only `tool_call_update`.
+ */
+export function descendantActivityProgress(
+  toolCallId: string,
+  text: string,
 ): Extract<SessionUpdate, { sessionUpdate: 'tool_call_update' }> {
   return {
     sessionUpdate: 'tool_call_update',
     toolCallId,
-    status: 'completed',
+    content: [{ type: 'content', content: { type: 'text', text } }],
+  }
+}
+
+/**
+ * Settle one open descendant-activity card with delegated-task fidelity: the
+ * outcome follows the descendant's own last `turn/end` (unknown fate keeps the
+ * historical `completed` default), and the summary is its last assistant line.
+ * @param toolCallId - the same bridge-owned synthetic id.
+ * @param outcome - the period's fate, defaulting to `completed`.
+ * @param summary - the descendant's last assistant one-liner, when it produced one.
+ * @returns the settling `tool_call_update`.
+ */
+export function descendantActivitySettle(
+  toolCallId: string,
+  outcome: 'completed' | 'failed' = 'completed',
+  summary: string | undefined = undefined,
+): Extract<SessionUpdate, { sessionUpdate: 'tool_call_update' }> {
+  return {
+    sessionUpdate: 'tool_call_update',
+    toolCallId,
+    status: outcome,
+    ...(summary === undefined || summary.length === 0 ? {} : {
+      content: [{ type: 'content' as const, content: { type: 'text' as const, text: summary } }],
+    }),
   }
 }
 
@@ -497,8 +609,7 @@ export function descendantHistoryFromEvents(
     } else if (event.type === 'assistant/message') {
       summary = oneLineText(event.data.message.content) ?? summary
     } else if (event.type === 'turn/end') {
-      const kind = event.data.reason.kind
-      fate = kind === 'completed' || kind === 'max-tokens' || kind === 'forked' ? 'completed' : 'failed'
+      fate = turnEndToFate(event.data.reason.kind)
     }
   }
   if (fate === undefined && title === undefined && summary === undefined) return undefined
@@ -523,7 +634,7 @@ export function descendantHistoryFromEvents(
 }
 
 /** Collapse one message's text blocks into a single capped line. */
-function oneLineText(blocks: readonly { type: string }[]): string | undefined {
+export function oneLineText(blocks: readonly { type: string }[]): string | undefined {
   const text = blocks
     .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
     .map(block => block.text)

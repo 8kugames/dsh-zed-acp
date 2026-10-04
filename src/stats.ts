@@ -423,14 +423,55 @@ function formatMs(ms: number): string {
   return ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`
 }
 
+/** Compact token-count rendering for always-visible title strips: `980`, `45.2k`, `1.2M`. */
+export function formatTokenCount(tokens: number): string {
+  if (tokens < 1_000) return String(tokens)
+  if (tokens < 1_000_000) {
+    const k = tokens / 1_000
+    // The 999.95 guard keeps a near-ceiling count from rounding to "1000k".
+    if (k < 999.95) return `${k >= 100 ? Math.round(k) : Number(k.toFixed(1))}k`
+  }
+  const m = tokens / 1_000_000
+  if (m >= 999.95) return `${Number((m / 1_000).toFixed(1))}B`
+  return `${m >= 100 ? Math.round(m) : Number(m.toFixed(1))}M`
+}
+
+/** All prompt tokens across dsh's three disjoint input buckets. Accepts both
+ * bucket vocabularies: a call's `TokenUsage.inputTokens` is uncached input,
+ * exactly like a scope's `uncachedInputTokens`. */
+export function sumPromptTokens(
+  usage: { inputTokens?: number; uncachedInputTokens?: number; cacheReadTokens?: number; cacheWriteTokens?: number },
+): number {
+  const uncached = usage.uncachedInputTokens ?? usage.inputTokens ?? 0
+  return uncached + (usage.cacheReadTokens ?? 0) + (usage.cacheWriteTokens ?? 0)
+}
+
+/** Token and cost facts a collapsed title strip can carry without expansion. */
+export interface StatsTitleFacts {
+  /** All prompt buckets summed (uncached + cache read + cache write). */
+  inputTokens: number
+  outputTokens: number
+  /** Priced turn cost, when the model's listing resolved. */
+  cost: { amount: number; currency: string } | undefined
+}
+
+/**
+ * The card row title shown while collapsed, naming the serving model when known.
+ * With `facts` it also carries the one-line usage summary, because expansion is
+ * a client-side decision the protocol cannot force: an unpriced model is named
+ * `unpriced` instead of silently dropping the cost segment.
+ */
+export function statsCardTitle(modelId: string | undefined, facts?: StatsTitleFacts): string {
+  const base = modelId === undefined ? 'Turn stats' : `Turn stats · ${modelId}`
+  if (facts === undefined) return base
+  const usage = `in ${formatTokenCount(facts.inputTokens)} / out ${formatTokenCount(facts.outputTokens)}`
+  const cost = facts.cost === undefined ? 'unpriced' : formatMoney(facts.cost.amount, facts.cost.currency)
+  return `${base} · ${usage} · ${cost}`
+}
+
 /** Format a currency amount with stable precision. */
 function formatMoney(amount: number, currency: string): string {
   return currency === 'USD' ? `$${amount.toFixed(4)}` : `${amount.toFixed(4)} ${currency}`
-}
-
-/** The card row title shown while collapsed, naming the serving model when known. */
-export function statsCardTitle(modelId: string | undefined): string {
-  return modelId === undefined ? 'Turn stats' : `Turn stats · ${modelId}`
 }
 
 /**
