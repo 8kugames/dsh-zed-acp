@@ -1,13 +1,38 @@
 # 更新日志
 
 本项目的所有显著变更都会记录在此文件。本格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0)，
-本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
+本项目遵循[语义化版本](https://semver.org/lang/zh-CN/1.1.0/)；各版本日期为 UTC 发布日。
 
 ## [Unreleased]
 
 ### 新增
 
 - ask_user_question 兜底自由输入：客户端在 initialize 声明 `elicitation.form` 能力时，每个问题菜单末尾自动合成 **Other** 选项（模型自带同名标签则不重复追加），选中后经 `elicitation/create` 表单收集自由文本，答案以 `selected: ["Other"]` 加 `custom` 文本回给模型，避免列出的选项全不合理时用户被锁死；表单 decline/cancel 回到菜单重选，菜单取消仍为 `ASK_CANCELLED`，模型侧自定义的 Other 标签在能力声明下同样路由到表单，未声明时保持普通标签作答（旧版行为）。无选项问题从降级 `NO_PROVIDER` 转正为直接弹出自由文本表单；能力未声明时行为与旧版完全一致（菜单不含 Other、无选项问题照旧降级）。四个预设的 plan-mode 段补一句引导：模型应把 custom 自由文本当作用户权威答案。
+
+### 修复
+
+- compact 后客户端 context 占用不回落：compaction 的摘要调用 usage 记在 log-only 的 `compaction/summary` 上而非带 usage 的 `assistant/message`，唯一 surface 变更又是一条 bridge 此前不投影的 `user/message` 替换事件，而 manual `/compact`（回合间、`turn: null`）的回合无模型调用、`emitTurnStats` 因 stats 缺失早退——两条既有 `usage_update` 发送路径（回合中 assistant 消息、回合末结算卡）都不触发，Zed 的 context 表停在压缩前的旧值直到下一个模型回复。现在实时事件路由对非 append 的 `user/message`（即 compaction 摘要 checkpoint 的替换事件）即刻按 token meter 重测占用并发出一条刷新的 `usage_update`（仅 used/size，与回合中 assistant 消息携带的口径一致）：manual `/compact` 立即回落，回合内自动压缩也在落地瞬间先降一次；压缩失败无替换事件、自然不发。选替换事件而非 `compaction/end` 作为触发点，是因为 bridge 不依赖 `dsh-compaction` 的声明合并类型，且未来任何 surface 替换生产者同样被覆盖；`session/load` 回放路径的 user/message 过滤在 `onSessionEvent` 之前，不受影响。
+- 成本跨币种混加：`TurnStatsCollector` 与 `foldTurnStats` 此前把不同 `currency` 的金额直接相加、货币字段取最新一次的值——当 `DSH_ACP_PRICES` 为不同模型配置不同 `currency` 时，同一回合/会话的累计费用会跨币种错加。现在回合内出现两种计价货币时该回合 cost 报 `undefined`（显示为 unpriced）；会话累计一旦混币即置粘性 `currencyMixed` 标记、此后保持 unpriced；token 与时长统计不受影响。
+- stdio 帧行无上限：生产接线的 NDJSON 流此前对无换行字节流无限缓冲、对完整行无上限 `JSON.parse`，失控的对端可用超长单行耗尽内存。现在 stdin 经 `WireLineLimiter`（64MiB 单行上限，常量外部化于 `src/codec.ts`）后再进 SDK 流，超限即断开连接并记录警告。
+- 图片 base64 解码前预检：超限图片此前在 attachment store 限额生效前已完整解码并重编码比对（约 3-4 倍输入的内存峰值）。现在按 base64 长度精确估算解码字节数，超出 store 的单图（`maxImageBytes`）或聚合（`maxMessageImageBytes`）限额时在解码前拒绝，store 不再被调用。
+
+### 变更
+
+- 安装指引与发布状态对齐：README 与 docs 的安装命令改为 npm registry 为主（`dsh plugin --profile zed add @8kugames/dsh-zed-acp`），git ref 降级为跟踪未发布分支的备选——此前文档仍称"首个 npm 发布之前"，而 registry 已发布 7 个版本。
+- 中文 README 移至 `docs/README.zh.md`：npm 会把根目录的 `README.zh.md` 选作包首页 README（`readmeFilename`），英文用户在 npmjs.com 首屏只见中文文档；移出根目录后 npm 确定展示英文 README，中文版随 `docs/` 一起发布并保留双语互链。
+- `package.json` 的 `files` 加入 `docs`：包内 README 链接的 `docs/zed-acp.md` 与 `docs/zed-acp.zh.md` 此前不在发布物中，npm 用户点击即 404。
+- docs 新增"插件配置"一节（双语）：补全 `provider` / `model` / `apiKeyEnv` / `sessionListPageSize` / `modelPreferencePath` / `imageInputs` 六个部署配置项的语义与默认值。
+- 版本纪律：此后新功能按 minor 版本发布（历史上的 0.1.1 与 0.2.2 为携带新功能的 patch，已发布版本不做追溯重编号）。
+- `usage_update` 与 `config_option_update` 的构造收拢进 `src/updates.ts`（新增 `contextUsageUpdate` / `turnEndUsageUpdate` / `configOptionUpdate`），`src/session.ts` 只负责路由与排队，消除 seam 账本枚举与实现的漂移；`src/version.ts` 注释中不存在的 `lib/` 路径更正为 `dist/`；README 英文版删除重复的一句计费说明，中文版定位语补回"面向 Zed 的"。
+- CHANGELOG 修复：补全 0.3.1 / 0.3.0 / 0.2.2 / 0.2.1 的版本引用定义，`[Unreleased]` 的 compare 基线从 v0.2.0 更新至 v0.3.1，统一 `[Unreleased]` 措辞，`[0.1.0]` 补勘误并将日期修正为 UTC 发布日。
+
+### 测试
+
+- `src/startup.ts` 结束零覆盖：新增 `tests/startup.spec.ts`（裸调用发布 `zedAcpStartup` 服务、stdin EOF 经 readiness 有界退出、dispose 后停听 EOF、`--help` 打印帮助且不启动 transport、未知 flag 报错退出不发布服务）。
+- 激活 fixture-server 的 `fail` / `crash` 工具：MCP 工具错误结果以 failed 卡片投影且回合正常 `end_turn`；server 进程回复后崩溃（exit 7）时结果照常结算、ACP 会话继续可用。
+- steer×cancel 竞态：图片准入挂起（deferred `saveImages`）期间取消回合，steering 返回 `promptRequired` 且图片不落盘。
+- `session/list` 标题缓存分支：projection cache 直接快照与 predecessor 回退两条路径均正确出标题。
+- 新增 `WireLineLimiter` 与货币混加（回合内/会话累计/粘性）单元测试。
 
 ## [0.3.1] - 2026-10-04
 
@@ -112,7 +137,9 @@
 
 - tool_call 标题提取: 把 code 加入 SALIENT_TITLE_FIELDS(位于 command 之后), 让 dsh 保留的 PTC run_code 工具在 Zed(kind=execute → 'Run Command')下显示其执行的 TypeScript 代码体, 而不是描述性 description 短语。其他工具的标题因字段不冲突保持不变。
 
-## [0.1.0] - 2026-09-28
+## [0.1.0] - 2026-09-27
+
+> **勘误（2026-10-05）**：本节最初误记了两项实际在 0.1.0 tag 之后才合入的能力——"回合统计"（含价表与 `DSH_ACP_PRICES`，由提交 111955d 引入）与"工具调用标题的显著参数提取、`job_*` 归类"（由提交 1d494da 引入）；二者实际随 0.1.1 发布，0.1.0 的发布产物（gitHead 53b7eb3）不含这些能力。本节日期同时从 +0800 撰写口径的 09-28 修正为 UTC 发布日 09-27。
 
 首次发布：作为 DeepSeek Harness (`@deepseek-ai/dsh@0.1.7-rc.2`) 的 Zed ACP 适配器插件，对应 ACP SDK `@agentclientprotocol/sdk@1.4.0`。
 
@@ -144,7 +171,11 @@
 - 双语 README 与 docs/zed-acp（英 / 中）。
 - `THIRD_PARTY_NOTICES.md` 列明运行时依赖与宿主 peer 依赖的版本与许可。
 
-[未发布]: https://github.com/8kugames/dsh-zed-acp/compare/zed-acp-v0.2.0...HEAD
+[Unreleased]: https://github.com/8kugames/dsh-zed-acp/compare/zed-acp-v0.3.1...HEAD
+[0.3.1]: https://github.com/8kugames/dsh-zed-acp/compare/zed-acp-v0.3.0...zed-acp-v0.3.1
+[0.3.0]: https://github.com/8kugames/dsh-zed-acp/compare/zed-acp-v0.2.2...zed-acp-v0.3.0
+[0.2.2]: https://github.com/8kugames/dsh-zed-acp/compare/zed-acp-v0.2.1...zed-acp-v0.2.2
+[0.2.1]: https://github.com/8kugames/dsh-zed-acp/compare/zed-acp-v0.2.0...zed-acp-v0.2.1
 [0.2.0]: https://github.com/8kugames/dsh-zed-acp/compare/zed-acp-v0.1.1...zed-acp-v0.2.0
 [0.1.1]: https://github.com/8kugames/dsh-zed-acp/releases/tag/zed-acp-v0.1.1
 [0.1.0]: https://github.com/8kugames/dsh-zed-acp/releases/tag/zed-acp-v0.1.0
