@@ -59,6 +59,7 @@ import {
   assistantUpdates,
   configOptionUpdate,
   contextUsage,
+  contextUsageUpdate,
   currentModeUpdate,
   descendantActivityOpen,
   descendantActivityProgress,
@@ -811,6 +812,25 @@ export class AcpSession {
             this.ctx.logger.warn(`acp: session-title update delivery failed: ${errorChain(error)}`)
           })
         /* v8 ignore stop */
+      } else if (event.type === 'user/message' && event.surfaceOp !== 'append') {
+        // A replacing user/message is a compaction checkpoint: the surface
+        // shrinks with no assistant message to carry fresh usage, so without
+        // this projection the client's context meter would keep the last
+        // request's pre-compaction reading until the next model reply.
+        const update = contextUsageUpdate(this.ctx, session)
+        if (update !== undefined) {
+          const previous = this.outputTail
+          this.outputTail = previous
+            .then(() => this.notify({
+              sessionId: this.agent.session.id,
+              update,
+            }))
+            /* v8 ignore start -- the bridge notifier contains transport failure. */
+            .catch((error: unknown) => {
+              this.ctx.logger.warn(`acp: compaction usage update delivery failed: ${errorChain(error)}`)
+            })
+          /* v8 ignore stop */
+        }
       } else if (event.type === 'tool/result') {
         const call = this.projectedCalls.get(event.data.message.toolCallId)
         this.projectedCalls.delete(event.data.message.toolCallId)

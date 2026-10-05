@@ -1,8 +1,8 @@
 /** Unit and bridge coverage for turn statistics, pricing, and cost reporting. */
 
 import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk'
-import type { AssistantStreamRecord, TokenUsage } from '@deepseek-ai/dsh-llm'
-import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import { MessageId, type AssistantStreamRecord, type TokenUsage } from '@deepseek-ai/dsh-llm'
+import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { makeBridgeHarness, textResponse, type BridgeHarness } from './harness.ts'
 import {
@@ -320,6 +320,67 @@ describe('bridge turn-stats delivery', () => {
       session: expect.objectContaining({ modelCalls: 1 }),
     })
     expect(final.cost).toBeUndefined()
+  })
+
+  it('refreshes usage_update when a between-turns compaction shrinks the surface', async () => {
+    harness = await makeBridgeHarness({ script: [textResponse(`answer ${'b'.repeat(400)}`)] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    await harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: `please echo ${'a'.repeat(400)}` }] })
+    await vi.waitFor(() => { expect(harness!.updates.at(-1)?.sessionUpdate).toBe('usage_update') })
+    const settled = harness.updates.at(-1)
+    if (settled?.sessionUpdate !== 'usage_update') throw new Error('expected settled usage update')
+    const usedBefore = settled.used
+    const updatesBefore = harness.updates.length
+
+    // A manual `/compact` between turns commits the log-only bracket plus the
+    // one surface replacement the summary rides on, and nothing else: no
+    // usage-bearing assistant message exists to refresh the client's context
+    // meter, so the replacement itself must carry the fresh occupancy.
+    const agent = harness.ctx.agents.get(SessionId(sessionId))!
+    const session = agent.session
+    const conversation = harness.ctx.get('tokenMeter')!.measure(session).nodes
+      .filter(node => {
+        const type = session.eventAt(node.seq)?.type
+        return type === 'user/message' || type === 'assistant/message'
+      })
+    expect(conversation.length).toBeGreaterThanOrEqual(2)
+    const startSeq = conversation[0]!.seq
+    const endSeq = conversation.at(-1)!.seq
+    const shadowedSeqs = conversation.map(node => node.seq)
+    const shadowedTokenCount = conversation.reduce((sum, node) => sum + node.heuristicTokens, 0)
+    const summary = [{ type: 'text', text: 'Earlier exchange summarized.' }] as const
+    const appendLog = (type: string, data: object): unknown =>
+      (session.append as unknown as (type: string, data: object) => unknown)(type, data)
+    const compactionId = 'compaction-1'
+    appendLog('compaction/start', { compactionId, turn: null })
+    appendLog('compaction/summary', {
+      compactionId,
+      summary,
+      shadowedRange: { start: startSeq, end: endSeq },
+      shadowedSeqs,
+      shadowedTokenCount,
+      provider: 'mock',
+      model: 'mock',
+      rawOutput: summary,
+      llmStreamCall: true,
+    })
+    session.append('user/message', {
+      id: MessageId('compaction-checkpoint-1'),
+      role: 'user',
+      content: [...summary],
+      source: { kind: 'compact-checkpoint', compactionId } as never,
+    } as never, {
+      surfaceOp: { op: 'replace', startSeq, endSeq },
+      sourceEventSeqs: shadowedSeqs,
+    })
+    appendLog('compaction/end', { compactionId, turn: null })
+
+    await vi.waitFor(() => { expect(harness!.updates.length).toBeGreaterThan(updatesBefore) })
+    const compacted = harness.updates.at(-1)
+    if (compacted?.sessionUpdate !== 'usage_update') throw new Error('expected post-compaction usage update')
+    expect(compacted.size).toBe(settled.size)
+    expect(compacted.used).toBeLessThan(usedBefore)
   })
 })
 
