@@ -224,6 +224,68 @@ describe('DSH_ACP_PRICES overrides', () => {
   })
 })
 
+describe('mixed-currency cost accounting', () => {
+  /** Flat table pricing two mock models in two different currencies. */
+  const mixedTable = mergePriceOverrides(DEEPSEEK_PRICE_TABLE, parsePriceOverrides(
+    '{"usd-model":{"hit":0,"miss":1,"out":0,"currency":"USD"},"eur-model":{"hit":0,"miss":1,"out":0,"currency":"EUR"}}',
+  ))
+
+  /** Feed the collector one usage-bearing model call on the current model id. */
+  function pricedCall(collector: TurnStatsCollector, model: string, step: number, atMs: number): void {
+    collector.record(stepStart(collector.turn, step, atMs))
+    collector.record(assistantMessage(collector.turn, step, atMs + 100, [], {
+      inputTokens: 1_000, outputTokens: 10,
+    }))
+    void model
+  }
+
+  it('drops the turn cost when one turn priced calls in two currencies', () => {
+    const models = ['usd-model', 'eur-model']
+    const collector = new TurnStatsCollector(3, () => models.shift(), mixedTable)
+    collector.record(event('turn/start', 3, PEAK_MS))
+    pricedCall(collector, 'usd-model', 0, PEAK_MS + 1)
+    pricedCall(collector, 'eur-model', 1, PEAK_MS + 200)
+    collector.record(event('turn/end', 3, PEAK_MS + 400))
+    const stats = collector.result()
+    // Summing a USD amount with an EUR amount would misreport both; the turn
+    // reports no cost instead, while token accounting stays complete.
+    expect(stats?.cost).toBeUndefined()
+    expect(stats?.usage.modelCalls).toBe(2)
+  })
+
+  it('keeps a single-currency turn priced and folds it into session totals', () => {
+    const collector = new TurnStatsCollector(3, () => 'usd-model', mixedTable)
+    collector.record(event('turn/start', 3, PEAK_MS))
+    pricedCall(collector, 'usd-model', 0, PEAK_MS + 1)
+    collector.record(event('turn/end', 3, PEAK_MS + 200))
+    expect(collector.result()?.cost).toEqual({ amount: 0.001, currency: 'USD' })
+  })
+
+  it('marks the session cost undefined once currencies mix, and the marker is sticky', () => {
+    const zeroTiming = { llmMs: 0, toolMs: 0, decodeMs: 0, decodeTokens: 0, ttftSumMs: 0, ttftCalls: 0 }
+    const usage = { uncachedInputTokens: 1_000, outputTokens: 10, modelCalls: 1 }
+    const usdTurn: TurnStats = { turn: 1, usage, timing: zeroTiming, cost: { amount: 0.001, currency: 'USD' } }
+    const eurTurn: TurnStats = { turn: 2, usage, timing: zeroTiming, cost: { amount: 0.002, currency: 'EUR' } }
+
+    const folded = foldTurnStats(foldTurnStats(emptySessionStats(), usdTurn), eurTurn)
+    expect(folded.cost).toBeUndefined()
+    expect(folded.currencyMixed).toBe(true)
+
+    // A later homogeneous turn cannot resurrect a single-figure cost: the
+    // session did spend in both currencies.
+    const again = foldTurnStats(folded, usdTurn)
+    expect(again.cost).toBeUndefined()
+    expect(again.currencyMixed).toBe(true)
+
+    // An unpriced turn folding into an unpriced-but-unmixed session stays
+    // unpriced without claiming a mix ever happened.
+    const unpricedTurn: TurnStats = { turn: 3, usage, timing: zeroTiming, cost: undefined }
+    const plain = foldTurnStats(emptySessionStats(), unpricedTurn)
+    expect(plain.cost).toBeUndefined()
+    expect(plain.currencyMixed).toBeUndefined()
+  })
+})
+
 describe('stats presentation', () => {
   /** A session carrying more turns than the fixture's single one. */
   const session: SessionStats = {

@@ -221,6 +221,12 @@ export interface SessionStats {
   timing: TimingTotals
   /** Cumulative cost across live turns since this ACP session opened. */
   cost: { amount: number; currency: string } | undefined
+  /**
+   * Sticky mixed-currency marker: once turns priced in different currencies
+   * fold into one session, a single amount+currency figure would lie, so the
+   * cost stays `undefined` (reported as unpriced) for the session's life.
+   */
+  currencyMixed?: boolean
 }
 
 /** A fresh, all-zero timing aggregate. */
@@ -292,6 +298,7 @@ export class TurnStatsCollector {
   private timing: TimingTotals = zeroTiming()
   private costAmount = 0
   private costCurrency: string | undefined
+  private costCurrencyMixed = false
 
   /**
    * @param turn - the turn number this collector follows.
@@ -347,8 +354,12 @@ export class TurnStatsCollector {
       this.usage = mergeUsage(this.usage, usage)
       const priced = resolvePrice(this.prices, this.modelId() ?? '', event.time)
       if (priced !== undefined) {
+        // Currencies are not convertible here; a turn that priced model calls
+        // in two currencies reports no cost rather than summing apples and
+        // oranges into whichever currency arrived last.
+        if (this.costCurrency === undefined) this.costCurrency = priced.currency
+        else if (this.costCurrency !== priced.currency) this.costCurrencyMixed = true
         this.costAmount += priceUsage(priced.rates, usage)
-        this.costCurrency = priced.currency
       }
     }
   }
@@ -363,7 +374,7 @@ export class TurnStatsCollector {
       turn: this.turn,
       usage: this.usage,
       timing: this.timing,
-      cost: this.costCurrency === undefined
+      cost: this.costCurrencyMixed || this.costCurrency === undefined
         ? undefined
         : { amount: round6(this.costAmount), currency: this.costCurrency },
     }
@@ -386,13 +397,20 @@ export function foldTurnStats(session: SessionStats, turn: TurnStats): SessionSt
     cacheWriteTokens: write === 0 ? undefined : write,
     modelCalls: session.usage.modelCalls + turn.usage.modelCalls,
   }
-  const cost = turn.cost === undefined
-    ? session.cost
-    : {
-        amount: round6((session.cost?.amount ?? 0) + turn.cost.amount),
-        currency: turn.cost.currency,
-      }
-  return { usage, timing: mergeTiming(session.timing, turn.timing), cost }
+  // A session that already folded a mixed-currency turn stays unpriced even
+  // when later turns agree on one currency again: the session did spend in
+  // both, and any single cumulative figure would misreport one of them.
+  const mixed = session.currencyMixed === true
+    || (session.cost !== undefined && turn.cost !== undefined && session.cost.currency !== turn.cost.currency)
+  const cost = mixed
+    ? undefined
+    : turn.cost === undefined
+      ? session.cost
+      : {
+          amount: round6((session.cost?.amount ?? 0) + turn.cost.amount),
+          currency: turn.cost.currency,
+        }
+  return { usage, timing: mergeTiming(session.timing, turn.timing), cost, ...(mixed ? { currencyMixed: true } : {}) }
 }
 
 /** Average first-token latency of a scope, or undefined when no call recorded one. */
