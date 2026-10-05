@@ -16,10 +16,10 @@ Install the CLI pinned to the version the plugin targets, add the Zed ACP plugin
 
 ```sh
 npm install -g @deepseek-ai/dsh@0.2.0-rc.2
-dsh plugin --profile zed add "github:8kugames/dsh-zed-acp#zed-acp"
+dsh plugin --profile zed add @8kugames/dsh-zed-acp
 ```
 
-The npm `latest` tag of the CLI may trail the version the plugin targets, and the plugin's compatibility gate refuses older dsh at install time, so the command above pins the version. The git ref names the branch that carries the plugin; the plugin installs from the npm registry as `@8kugames/dsh-zed-acp` once its first release ships.
+The npm `latest` tag of the CLI may trail the version the plugin targets, and the plugin's compatibility gate refuses older dsh at install time, so the command above pins the version. The plugin installs from the npm registry; to track the branch carrying unreleased work instead, install the repository ref (`dsh plugin --profile zed add "github:8kugames/dsh-zed-acp#zed-acp"`).
 
 ```json
 {
@@ -37,6 +37,27 @@ The npm `latest` tag of the CLI may trail the version the plugin targets, and th
 ```
 
 Zed launches the agent as a subprocess and speaks the Agent Client Protocol over its stdio. The first launch initializes the `zed` profile under the harness home, and the plugin's bundle patch mounts the Zed-oriented ACP server over the harness base composition. The plugin ships no runtime of its own: every harness module loads from the installed dsh, so upgrading dsh upgrades the agent. Adding the plugin to the shipped automation profile instead — `dsh plugin --profile acp add @8kugames/dsh-zed-acp` — also works: the patch disables that profile's automation-only ACP transport so exactly one server owns stdio. `env` entries override the environment Zed passes through, so the key can live here or in your shell environment; a key in either place is resolved the same way.
+
+## Plugin configuration
+
+Every option below is optional; defaults cover a plain install. A deployment sets them on the plugin's `zed-acp` row in the profile's own `cordis.patch.yml` overlay (`$DSH_HOME/profiles/zed/cordis.patch.yml`):
+
+```yaml
+- id: zed-acp
+  config:
+    provider: my-gateway        # with model: the exact route every new session starts on
+    model: my-model
+    apiKeyEnv: MY_GATEWAY_API_KEY # credential env var `authenticate` resolves
+    sessionListPageSize: 100    # max sessions per session/list page
+    modelPreferencePath: ~/.dsh/zed-acp-reasoning-efforts.json
+    imageInputs: auto           # auto | true | false
+```
+
+- `provider` + `model` — when both are set, every new session starts pinned to this exact route instead of the composition's default model. Omit both to follow the composition's agent-default-model selection.
+- `apiKeyEnv` — the environment variable the `authenticate` handshake resolves (default `DEEPSEEK_API_KEY`); it must name the same variable the composed LLM provider reads its key from.
+- `sessionListPageSize` — maximum sessions one `session/list` page returns (default `100`, positive integer).
+- `modelPreferencePath` — the file reasoning-effort choices persist to across sessions (default `~/.dsh/zed-acp-reasoning-efforts.json`). Pin an absolute path when parallel installs or tests share one machine.
+- `imageInputs` — whether inline image prompts are advertised: `auto` (default) only when the route a fresh session starts on declares image input; `true` is the deployment's explicit promise for adapters whose catalog omits the declaration (the per-prompt route check still refuses unsupported routes); `false` never advertises.
 
 ## Authenticate and prompt
 

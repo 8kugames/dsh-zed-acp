@@ -16,10 +16,10 @@
 
 ```sh
 npm install -g @deepseek-ai/dsh@0.2.0-rc.2
-dsh plugin --profile zed add "github:8kugames/dsh-zed-acp#zed-acp"
+dsh plugin --profile zed add @8kugames/dsh-zed-acp
 ```
 
-CLI 的 npm `latest` 标签可能落后于插件对应的版本，而且插件的兼容门会在安装时拒绝更旧的 dsh，所以上面的命令钉住了版本。git ref 指向携带插件的分支；插件的首个发布上线后，即可从 npm registry 以 `@8kugames/dsh-zed-acp` 安装。
+CLI 的 npm `latest` 标签可能落后于插件对应的版本，而且插件的兼容门会在安装时拒绝更旧的 dsh，所以上面的命令钉住了版本。插件从 npm registry 安装；若要跟踪携带未发布改动的分支，改用仓库 ref 安装（`dsh plugin --profile zed add "github:8kugames/dsh-zed-acp#zed-acp"`）。
 
 ```json
 {
@@ -37,6 +37,27 @@ CLI 的 npm `latest` 标签可能落后于插件对应的版本，而且插件�
 ```
 
 Zed 以子进程方式启动 agent，并通过其 stdio 交谈 Agent Client Protocol。首次启动会在 harness home 下初始化 `zed` profile，插件的 bundle 补丁会把面向 Zed 的 ACP 服务器挂载到 harness 基础组成之上。插件自身不带任何运行时：所有 harness 模块都从已安装的 dsh 加载，升级 dsh 即升级 agent。把插件装进随附的自动化 profile——`dsh plugin --profile acp add @8kugames/dsh-zed-acp`——同样可行：补丁会禁用该 profile 仅面向自动化的 ACP 传输，保证 stdio 上只有一个服务器。`env` 条目会覆盖 Zed 透传的环境，因此 key 可以放在这里或你的 shell 环境里；两处的 key 以同一方式解析。
+
+## 插件配置
+
+以下选项全部可省略，默认值覆盖普通安装。部署方在 profile 自己的 `cordis.patch.yml` 覆盖层（`$DSH_HOME/profiles/zed/cordis.patch.yml`）中的 `zed-acp` 行上设置它们：
+
+```yaml
+- id: zed-acp
+  config:
+    provider: my-gateway        # 与 model 一起：每个新会话起始钉定的确切路由
+    model: my-model
+    apiKeyEnv: MY_GATEWAY_API_KEY # authenticate 握手解析的凭据环境变量
+    sessionListPageSize: 100    # 每页 session/list 返回的最大会话数
+    modelPreferencePath: ~/.dsh/zed-acp-reasoning-efforts.json
+    imageInputs: auto           # auto | true | false
+```
+
+- `provider` + `model`——两者同时设置时，每个新会话都从这条确切路由开始，而不是组合的默认模型；两者都省略则跟随组合的 agent-default-model 选择。
+- `apiKeyEnv`——`authenticate` 握手解析的环境变量（默认 `DEEPSEEK_API_KEY`）；它必须与组合的 LLM provider 读取 key 的变量同名。
+- `sessionListPageSize`——一页 `session/list` 返回的最大会话数（默认 `100`，正整数）。
+- `modelPreferencePath`——reasoning-effort 选择跨会话持久化的文件（默认 `~/.dsh/zed-acp-reasoning-efforts.json`）。多份安装或测试共用一台机器时请钉绝对路径。
+- `imageInputs`——是否播报内联图片输入：`auto`（默认）仅当新会话起始路由声明图片输入时播报；`true` 是部署方对目录缺声明的适配器的显式承诺（逐提示的路由检查仍会拒绝不支持的路由）；`false` 从不播报。
 
 ## 认证并发送任务
 
