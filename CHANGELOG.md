@@ -5,6 +5,8 @@
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-05
+
 ### 新增
 
 - 价格可写入插件配置面（profile 自有覆盖层 `$DSH_HOME/profiles/zed/cordis.patch.yml` 的 `zed-acp` 行）：新增 `prices: { defaultCurrency, models: [{ id: <模型 id>, hit, miss, out, currency? }] }`（`models` 为逐模型一行的列表，与本覆盖层 provider 路由的行形态一致，id 必须唯一），费率单位为每 1M token（`hit` 命中缓存的输入、`miss` 未缓存输入加缓存写入、`out` 输出），扁平费率全时段生效。此前的 `DSH_ACP_PRICES` 环境变量不再是唯一入口：写在 Zed `agent_servers` 的 JSON 里需要 JSON 套 JSON 的层层转义，YAML 嵌套没有这个问题。校验分两处：类型与非负费率由插件 schema 在加载期拒绝，ISO 4217 币种码与未知键由价目解析拒绝（拼错的 `defaultCurrency`/`currency` 会显式报错，不再静默按缺省处理），两者都会让插件起不来；环境变量那份则维持「记警告 + 整份丢弃」。两者同时存在时以 `prices` 为准，`DSH_ACP_PRICES` 会在日志里被明确记为已忽略而非静默失效，警告文本会指出需要把费率搬进 `prices.models`；仅用环境变量的既有部署行为不变。`prices.models` 的键按大小写精确匹配服务侧 id，且不再需要 `$` 前缀保留命名空间（`defaultCurrency` 是 `models` 的同级键而非其内部的元键；该保留区只存在于环境变量路径，配置路径原样接受以 `$` 开头的 id）。仅影响费用展示，不改变 token 统计。
@@ -177,7 +179,8 @@
 - 双语 README 与 docs/zed-acp（英 / 中）。
 - `THIRD_PARTY_NOTICES.md` 列明运行时依赖与宿主 peer 依赖的版本与许可。
 
-[Unreleased]: https://github.com/8kugames/dsh-zed-acp/compare/zed-acp-v0.3.1...HEAD
+[Unreleased]: https://github.com/8kugames/dsh-zed-acp/compare/zed-acp-v0.3.2...HEAD
+[0.3.2]: https://github.com/8kugames/dsh-zed-acp/compare/zed-acp-v0.3.1...zed-acp-v0.3.2
 [0.3.1]: https://github.com/8kugames/dsh-zed-acp/compare/zed-acp-v0.3.0...zed-acp-v0.3.1
 [0.3.0]: https://github.com/8kugames/dsh-zed-acp/compare/zed-acp-v0.2.2...zed-acp-v0.3.0
 [0.2.2]: https://github.com/8kugames/dsh-zed-acp/compare/zed-acp-v0.2.1...zed-acp-v0.2.2
