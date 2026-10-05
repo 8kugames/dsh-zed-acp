@@ -2,7 +2,7 @@
 
 import { describe, it, expect, afterEach, vi } from 'vitest'
 import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk'
-import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { makeBridgeHarness, readSessionLog, textResponse } from './harness.ts'
 import type { BridgeHarness } from './harness.ts'
 
@@ -278,5 +278,144 @@ describe('_session/steering', () => {
     await expect(prompt).resolves.toEqual({ stopReason: 'cancelled' })
     // The steered image never entered the durable transcript.
     expect(userPromptTexts(await readSessionLog(harness.ctx, session.sessionId))).toEqual(['original'])
+  })
+
+  it('admits a steered image against the route the running turn is pinned to', async () => {
+    // A model option change mid-turn rewrites the session's live selection but
+    // leaves the running turn pinned to the route it started on, so admission
+    // must read the pinned route. Reading the live selection instead refuses an
+    // image-capable turn after a switch to `plain`, and admits one the pinned
+    // route could not take.
+    harness = await makeBridgeHarness({ imageCapable: true, script: ['hang'] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const session = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const prompt = harness.client.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: 'text', text: 'original' }],
+    })
+    await waitForRunningTurn()
+
+    // `mock` is the image-capable route the turn pinned; `plain` never is.
+    await harness.client.setSessionConfigOption({
+      sessionId: session.sessionId,
+      configId: 'model',
+      value: '["mock","plain"]',
+    })
+
+    await expect(harness.client.steer({
+      sessionId: session.sessionId,
+      prompt: [{ type: 'image', data: TINY_PNG, mimeType: 'image/png' }],
+    } as never)).resolves.toEqual({ outcome: 'injected' })
+
+    await harness.client.cancel({ sessionId: session.sessionId })
+    await prompt
+  })
+
+  it('answers promptRequired when admission spans a turn handover', async () => {
+    // Image admission awaits attachment storage, and that await spans whole
+    // turn handovers: T1 can settle and a later prompt can claim T2 while the
+    // message is still being admitted. The block was admitted on T1's pinned
+    // route, so injecting it into T2 would deliver it on terms T2 never had —
+    // the re-check must pin the identity of the aimed turn, not merely ask
+    // whether some turn happens to be live.
+    harness = await makeBridgeHarness({
+      imageCapable: true,
+      script: [{ chunks: textResponse('first'), holdMs: 500 }, 'hang'],
+    })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const session = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const prompt1 = harness.client.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: 'text', text: 'one' }],
+    })
+    await waitForRunningTurn()
+
+    const store = harness.attachments
+    if (store === undefined) throw new Error('expected the harness attachment store')
+    const originalSave = store.saveImages.bind(store)
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const saveImages = vi.spyOn(store, 'saveImages')
+      .mockImplementation(async inputs => { await gate; return originalSave(inputs) })
+
+    // Aimed at T1 while T1 is live: reaching saveImages proves the first
+    // steerable() check passed, and admission is now held open.
+    const steered = harness.client.steer({
+      sessionId: session.sessionId,
+      prompt: [{ type: 'image', data: TINY_PNG, mimeType: 'image/png' }],
+    } as never)
+    await vi.waitFor(() => { expect(saveImages).toHaveBeenCalled() })
+
+    // T1 finishes on its own while admission is still held; its inflight slot
+    // is cleared before the prompt resolves.
+    await expect(prompt1).resolves.toEqual({ stopReason: 'end_turn' })
+
+    // Retarget the session, then start T2 pinned to the new route: by the time
+    // admission resumes, the only live turn is one this message never aimed at.
+    await harness.client.setSessionConfigOption({
+      sessionId: session.sessionId,
+      configId: 'model',
+      value: '["mock","plain"]',
+    })
+    const prompt2 = harness.client.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: 'text', text: 'two' }],
+    })
+    await vi.waitFor(() => { expect(harness!.adapter.requests.length).toBe(2) })
+
+    release()
+    await expect(steered).resolves.toEqual({ outcome: 'promptRequired', reason: 'noRunningTurn' })
+    saveImages.mockRestore()
+
+    await harness.client.cancel({ sessionId: session.sessionId })
+    await expect(prompt2).resolves.toEqual({ stopReason: 'cancelled' })
+  })
+
+  it('refuses to steer a driver that already reports idle', async () => {
+    // The window where the driver has retired but the bridge has not yet seen
+    // its `turn/end` is not reachable through the harness, so it is forced here:
+    // without this guard the injected message would wake an idle driver into a
+    // turn no ACP request owns.
+    harness = await makeBridgeHarness({ script: ['hang'] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const session = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const prompt = harness.client.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: 'text', text: 'original' }],
+    })
+    await waitForRunningTurn()
+
+    const agent = harness.ctx.agents.get(SessionId(session.sessionId))
+    if (agent === undefined) throw new Error('expected the session agent')
+    Object.defineProperty(agent, 'status', { value: 'idle', configurable: true, writable: true })
+
+    await expect(harness.client.steer({
+      sessionId: session.sessionId,
+      prompt: [{ type: 'text', text: 'after the driver retired' }],
+    } as never)).resolves.toEqual({ outcome: 'promptRequired', reason: 'noRunningTurn' })
+
+    await harness.client.cancel({ sessionId: session.sessionId })
+    await prompt
+  })
+
+  it('rejects an idleBehavior this bridge does not implement', async () => {
+    harness = await makeBridgeHarness()
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const session = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+
+    // Only `promptRequired` is defined; an unimplemented policy must fail
+    // rather than silently be answered with the one policy it never asked for,
+    // and it must fail under the invalid-params code the extension promises.
+    const rejection = await harness.client.steer({
+      sessionId: session.sessionId,
+      prompt: [{ type: 'text', text: 'hi' }],
+      _meta: { steering: { idleBehavior: 'autoPrompt' } },
+    } as never).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
+    expect(rejection).toBeInstanceOf(Error)
+    expect((rejection as { code?: unknown }).code).toBe(-32602)
+    expect((rejection as Error).message).toMatch(/idleBehavior/)
   })
 })

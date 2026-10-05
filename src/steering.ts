@@ -17,11 +17,13 @@
  * - `promptRequired` with `reason: 'noRunningTurn'` — nothing was running to
  *   join. The client sends an ordinary `session/prompt` instead.
  *
- * ponytail: `idleBehavior` is accepted and validated for forward
- * compatibility but only `promptRequired` is honored, because promoting an
- * idle session into a turn would mean starting work no ACP request is waiting
- * on — with no owner for its stop reason, cost accounting, or output stream. A
- * future `idleBehavior: 'autoPrompt'` would need that owner first.
+ * `_meta.steering.idleBehavior` is a real, validated field: `promptRequired` is
+ * the only policy this bridge implements, so any other value is `invalidParams`
+ * rather than being answered with a policy the client never asked for.
+ * `ponytail:` the one implemented policy — promoting an idle session into a
+ * turn would mean starting work no ACP request is waiting on, with no owner for
+ * its stop reason, cost accounting, or output stream. A future
+ * `idleBehavior: 'autoPrompt'` would need that owner first.
  * @module @8kugames/dsh-zed-acp/steering
  */
 
@@ -62,15 +64,67 @@ function invalid(detail: string): RequestError {
   return RequestError.invalidParams(undefined, detail)
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+/**
+ * Render an unexpected idle policy for the error detail.
+ *
+ * The client chose this value, so echoing it back is how it learns which field
+ * was refused — but it must not get to decide the size of the refusal: a
+ * hostile or merely careless `_meta` could otherwise be echoed wholesale, and a
+ * value the JSON encoder cannot handle must not throw inside the error path.
+ * @param value - the refused `idleBehavior` value.
+ * @returns a bounded rendering of it.
+ */
+function describeIdleBehavior(value: unknown): string {
+  let rendered: string
+  try {
+    rendered = JSON.stringify(value) ?? String(value)
+  } catch {
+    rendered = String(value)
+  }
+  return rendered.length <= 120 ? rendered : `${rendered.slice(0, 117)}…`
+}
+
+/**
+ * Enforce `_meta.steering.idleBehavior`.
+ *
+ * Omitting `_meta`, or omitting `idleBehavior` inside it, keeps the current
+ * behavior — the request is answered as `promptRequired` implies, exactly as
+ * the ACP extension rule "omitting idleBehavior uses the same behavior"
+ * requires. A value that names a policy this bridge does not implement is
+ * `invalidParams`: falling back to the implemented one would answer a contract
+ * the client never signed.
+ * @param meta - the request's `_meta` payload.
+ * @throws {RequestError} `invalidParams` on an unimplemented idle policy.
+ */
+function assertIdleBehavior(meta: unknown): void {
+  if (!isRecord(meta)) return
+  const steering = meta['steering']
+  if (!isRecord(steering)) return
+  const idleBehavior = steering['idleBehavior']
+  if (idleBehavior === undefined) return
+  if (idleBehavior !== 'promptRequired') {
+    throw invalid(
+      `steering _meta.steering.idleBehavior: only "promptRequired" is implemented, got ${describeIdleBehavior(idleBehavior)}`,
+    )
+  }
+}
+
 /**
  * Parse and narrow one `_session/steering` request.
  *
- * Only the envelope is validated here — `sessionId` and a non-empty `prompt`
- * array. Block-level admission (image capability, route support, attachment
- * limits) belongs to the same `admitAcpPrompt` path `session/prompt` uses, so a
- * steered message can never be admitted on weaker terms than a prompted one.
+ * The envelope (`sessionId` and a non-empty `prompt` array) and the
+ * `_meta.steering` policy block are validated here. Block-level admission
+ * (image capability, route support, attachment limits) belongs to the same
+ * `admitAcpPrompt` path `session/prompt` uses, so a steered message can never
+ * be admitted on weaker terms than a prompted one.
  * @param params - raw JSON-RPC params.
  * @returns the validated request.
+ * @throws {RequestError} `invalidParams` on a malformed envelope or an
+ * unimplemented idle policy.
  */
 export function parseSteeringRequest(params: unknown): AcpSteeringRequest {
   if (typeof params !== 'object' || params === null || Array.isArray(params)) {
@@ -85,14 +139,6 @@ export function parseSteeringRequest(params: unknown): AcpSteeringRequest {
   if (!Array.isArray(prompt) || prompt.length === 0) {
     throw invalid('steering prompt must be a non-empty content-block array')
   }
+  assertIdleBehavior(record['_meta'])
   return { sessionId, prompt: prompt as readonly ContentBlock[] }
 }
-
-/**
- * The SDK's custom-method registration hook: a bare parse function is a valid
- * `ParamsParser`. Exposed so the transport wiring and the contract stay in one
- * place.
- * @param params - raw JSON-RPC params.
- * @returns the validated request.
- */
-export const steeringParamsParser = parseSteeringRequest

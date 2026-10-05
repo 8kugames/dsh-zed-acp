@@ -9,6 +9,12 @@
 
 - 后台子代理结算唤醒路径：回合在后代仍在运行时结束的，bridge 会在其后代全部空闲后为同一张仍打开的 `session/prompt` 追加一个**续跑回合**（复用 agent 句柄已有的 `followup()`），委派了工作的 agent 因此能读到后代结果并给出最终答复，不必再用阻塞式 shell 调用（例如 `sleep`）把自己的回合按住。此前 `steering.ts` 记录的那个「没有所有者」缺口在这里由已经打开的 prompt 本身补齐：续跑的 stop reason、计费与输出流仍归该 prompt，最终取值来自最后一个回合。续跑消息携带本仓自有的 `MessageSourceMap` 来源 `acp-descendant-continuation` 而非 `user`，因此 `session/load` 的历史回放不会把 harness 发起的续跑当成人类输入，实时投影也不把它当人类消息渲染。每个 prompt 的续跑次数以 `DESCENDANT_WAKE_LIMIT` 为界，避免一条不断派生新后代的委派链把客户端请求无限按住；取消路径不触发续跑。配套把这条契约写进四个内置预设的 persona 段（standard/ptc/cordis 加在 suffix，minimal 因 `complete: true` 只有 prefix 而加在 prefix），明确告知模型「委派的后台工作会在结算后以续跑回合唤醒你，直接结束回合即可」，让模型不再用阻塞式 shell 调用（如 `sleep`）把自己的回合按住等结果。**影响**：一个回合在后代仍在运行时结束的委派会话，现在会多出一个由 bridge 发起的续跑回合。
 
+### 修复
+
+- `_session/steering` 的三处适配缺口与回合统计的模型口径。其一，`_meta.steering.idleBehavior` 此前只在文件头注释里声称「已接受并校验」，实现却从不读 `_meta`：客户端发送未实现的策略会被静默按 `promptRequired` 作答，而注释让它看起来已被拒绝——现在解析期即拒绝未知取值并回 `invalidParams`（`-32602`），缺省仍等同 `promptRequired`、行为不变；错误回显带长度上界且序列化容错，被拒的值不再能决定拒绝响应的大小。其二，转向消息的内容准入此前读会话的**当前**模型选择（`snapshot()`），而回合跑的是 `pinTurn` 钉定的路由（`selection.current`）：回合中经 `session/setConfigOption` 切换模型后，带图转向会按**新**路由判图片能力、却注入跑**旧**路由的回合（或反向误放）——现在准入读钉定路由，与该回合装配模型请求所用的表达式一致。其三，`steer()` 的二次复检此前只问「有没有活回合」：图片准入 await 附件写入期间，原回合可以结算、后续 prompt 可以领取新回合，消息遂以旧回合的准入结论注入一个它从未瞄中的回合——现在复检连同**回合身份**一起钉定（沿用同文件结算路径的 `this.inflight !== inflight` 范式），目标回合已易主即回 `promptRequired`。同时 `steerable()` 补上 `agent.status === 'running'`，该半边以 `ponytail:` 标注为**未复现**的防御加固（`session/event` 在 `append()` 内同步派发，今日不改变任何可观测结果），覆盖的是 settlement 自己已容忍的「`endReason` 迟迟未到」那类窗口，避免驱动器已空闲时由 `agent.steer()` 开出一个没有 ACP 请求在等的回合。其四，回合统计的模型口径：`trackStats` 的计价闭包与 `emitTurnStats` 的卡片标题此前都读会话当前选择，回合中切模型会把**已发生**的用量按新模型计价、把结算卡标题换成新模型——现在按每个 `turn/start` 时仍在钉定中的路由计价与留痕（结算时 `releaseTurn` 已把 pin 还给实时选择，故必须在回合开始时记下），成本与卡片名因此指向真正服务该回合的模型。
+
+**影响**：发送未知 `idleBehavior` 的客户端会收到 `-32602` 拒绝（此前被静默接受）；其余三项为行为修正，无接口变更。
+
 ## [0.3.2] - 2026-10-05
 
 ### 新增

@@ -197,6 +197,11 @@ interface InflightPrompt {
   outputError: Error | undefined
   agentError: Error | undefined
   stats: TurnStats | undefined
+  /**
+   * Model this prompt's turns are pinned to, read at each `turn/start` while
+   * that turn's route is still pinned — the one that actually served the usage.
+   */
+  statsModelId: string | undefined
   /** Bridge-issued continuation turns already spent by this prompt. */
   continuations: number
 }
@@ -656,6 +661,7 @@ export class AcpSession {
       outputError: undefined,
       agentError: undefined,
       stats: undefined,
+      statsModelId: undefined,
       continuations: 0,
     }
     this.inflight = inflight
@@ -748,29 +754,49 @@ export class AcpSession {
     signal: AbortSignal,
   ): Promise<AcpSteeringOutcome> {
     this.assertActive()
+    const aimed = this.inflight
     if (!this.steerable()) return steeringPromptRequired()
-    const content = await admitAcpPrompt(this.ctx, this.modelControl.snapshot(), prompt, imageEnabled, signal)
+    // Admission reads the route this turn was pinned to, not the session's live
+    // selection: a model option change mid-turn rewrites `selected` while the
+    // running turn keeps the route it started on, and a steered block must be
+    // admitted on exactly the terms the turn that receives it is running on.
+    const content = await admitAcpPrompt(this.ctx, this.modelControl.selection.current, prompt, imageEnabled, signal)
     // Re-check: admission awaits attachment storage, and the turn the message
-    // was aimed at may have settled while it ran.
-    if (!this.steerable()) return steeringPromptRequired()
+    // was aimed at may have settled — or been replaced by a later prompt that
+    // claimed a new one — while it ran. `aimed` pins *which* turn: `steerable()`
+    // alone asks whether some turn is live, which would let a block admitted on
+    // one turn's route inject into another turn's queue.
+    if (this.inflight !== aimed || !this.steerable()) return steeringPromptRequired()
     this.agent.steer(createUserMessage({ content, source: { kind: 'user' } }))
     return steeringInjected()
   }
 
   /**
    * Whether a running turn exists to receive a steered message: the in-flight
-   * prompt holds a claimed turn that has neither ended nor been cancelled.
+   * prompt holds a claimed turn that has neither ended nor been cancelled, and
+   * the driver receiving it is still running.
    *
    * `settlementStarted` is deliberately *not* the test — it is set the moment
    * the prompt is queued, because settlement runs for the whole life of a turn
    * awaiting quiescence. The precise "this turn is over" fact is `endReason`,
    * recorded when the turn's own `turn/end` commits.
+   *
+   * ponytail: the `agent.status` half is defensive hardening, not a reproduced
+   * gap — `session/event` is dispatched synchronously inside `append()`, so
+   * today `endReason` and the turn's retirement land in one synchronous block
+   * and the status check never changes an outcome. It is the one read of driver
+   * reality the slot's own record cannot supply: settlement already tolerates a
+   * slot whose `endReason` never arrived (`settleAfterQuiescence` resolves it as
+   * cancelled rather than asserting that impossible), so a slot that still
+   * looks live while the driver has gone idle is exactly the window where
+   * `agent.steer()` would open a turn no ACP request owns.
    */
   private steerable(): boolean {
     const inflight = this.inflight
     if (inflight === undefined) return false
     if (inflight.turn === undefined) return false
-    return !inflight.cancelRequested && inflight.endReason === undefined
+    if (inflight.cancelRequested || inflight.endReason !== undefined) return false
+    return this.agent.status === 'running'
   }
 
   /** Cancel the active prompt, or autonomous work when no ACP prompt exists. */
@@ -1160,9 +1186,16 @@ export class AcpSession {
     const inflight = this.inflight
     if (inflight === undefined) return
     if (event.type === 'turn/start') {
+      // Read the route while this turn still owns the pin: `selection.current`
+      // is the pair prompt assembly applies, so usage recorded after a mid-turn
+      // model option change is priced against the model that served it rather
+      // than the one the session has since selected. The turn start also stamps
+      // the slot, because settlement reads the pin only after `releaseTurn` has
+      // already handed it back to the live selection.
+      inflight.statsModelId = this.modelControl.selection.current?.model
       this.statsCollector = new TurnStatsCollector(
         event.data.turn,
-        () => this.modelControl.snapshot()?.model,
+        () => this.modelControl.selection.current?.model,
         this.prices,
       )
       return
@@ -1199,7 +1232,10 @@ export class AcpSession {
     if (inflight.outputError !== undefined || inflight.agentError !== undefined) return
     const end = inflight.endReason
     if (end === undefined || end.kind === 'error') return
-    const modelId = this.modelControl.snapshot()?.model
+    // The pin is gone by now (`turn/end` released it), so the model named on
+    // the card is the one stamped when the turn started, not whatever the
+    // session selects by the time settlement runs.
+    const modelId = inflight.statsModelId ?? this.modelControl.snapshot()?.model
     const updates: SessionUpdate[] = turnStatsCard(
       `dsh-stats-${stats.turn}`,
       statsCardTitle(modelId, {
