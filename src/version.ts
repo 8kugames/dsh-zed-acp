@@ -8,7 +8,7 @@ import { createRequire } from 'node:module'
 // The package's own manifest is the single source of the version so the
 // advertised agent info cannot drift from what is published (`./package.json`
 // is an export of this package; the relative path resolves from both `src/`
-// and the bundled `lib/`).
+// and the bundled `dist/`).
 
 /**
  * The package manifest's `version` field, read once at module load.
