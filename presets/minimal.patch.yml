@@ -5,13 +5,13 @@
 # `config.plugins` by id.
 - insert:
     - id: preset-minimal
-      name: '@deepseek-ai/dsh-agent-preset'
+      name: "@deepseek-ai/dsh-agent-preset"
       config:
         id: minimal
         order: 3
         plugins:
           - id: persona
-            name: '@deepseek-ai/dsh-persona'
+            name: "@deepseek-ai/dsh-persona"
             config:
               prefix: You are a helpful software engineer assistant.
               complete: true
@@ -23,14 +23,14 @@
               terminals: true
             config:
               - id: pty
-                name: '@deepseek-ai/dsh-terminal'
+                name: "@deepseek-ai/dsh-terminal"
               - id: terminal-bash
-                name: '@deepseek-ai/dsh-terminal-bash'
+                name: "@deepseek-ai/dsh-terminal-bash"
                 disabled: !!js process.platform === 'win32'
                 config:
                   timeoutMs: 300000
               - id: persistent-bash
-                name: '@deepseek-ai/dsh-tool-bash-persistent'
+                name: "@deepseek-ai/dsh-tool-bash-persistent"
                 disabled: !!js process.platform === 'win32'
                 config:
                   timeoutMs: 300000
@@ -43,13 +43,13 @@
                     * Please avoid commands that may produce a very large amount of output.
                     * Please run long lived commands in the background, e.g. 'sleep 10 &' or start a server in the background.
               - id: terminal-pwsh
-                name: '@deepseek-ai/dsh-terminal-bash'
+                name: "@deepseek-ai/dsh-terminal-bash"
                 disabled: !!js process.platform !== 'win32'
                 config:
                   shellDialect: pwsh
                   timeoutMs: 300000
               - id: persistent-pwsh
-                name: '@deepseek-ai/dsh-tool-pwsh-persistent'
+                name: "@deepseek-ai/dsh-tool-pwsh-persistent"
                 disabled: !!js process.platform !== 'win32'
                 config:
                   timeoutMs: 300000
@@ -71,7 +71,7 @@
               planMode: true
             config:
               - id: plan-mode
-                name: '@deepseek-ai/dsh-plan-mode'
+                name: "@deepseek-ai/dsh-plan-mode"
                 config:
                   section: |
                     You are in plan mode. Stay in plan mode until exit_plan_mode succeeds or the user switches the session mode. Imperative language to implement changes means plan the implementation, not execute it. A user's conversational agreement — including an answer confirming something you asked — approves nothing and does not end plan mode; fold the confirmed decision into the plan and submit it through exit_plan_mode.
@@ -80,7 +80,7 @@
 
                     The tool catalog stays the same across modes for request-cache stability. These plan-mode rules override any later tool description or guidance that suggests using mutation tools; those tools remain listed to keep the tool catalog unchanged. Do not use todo_write to track this planning phase: it tracks implementation after an approved plan, while the plan itself belongs in exit_plan_mode.
 
-                    Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out.
+                    Resolve discoverable facts by inspection. Use ask_user_question only for user-owned choices or material ambiguity that inspection cannot answer. Do not ask the user where code lives or how current behavior works when you can find out. A user answer may carry custom free text typed through the harness's Other option; treat that free text as the authoritative answer rather than a rejected question.
 
                     Make the plan decision-complete: state the goal and success criteria; group implementation changes by subsystem; identify public API, schema, and data-flow changes; cover edge cases, failure modes, tests, acceptance criteria, and explicit assumptions. Keep it concise enough to review but detailed enough that another engineer can implement it without making design decisions.
 

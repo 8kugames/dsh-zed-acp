@@ -5,8 +5,10 @@
  * such as Zed. It carries standard configuration, agent-preset, permission, and
  * default/plan session-mode selects, MCP mounts, prompt content, committed
  * semantic updates with tool kinds and file diffs, credential authentication,
- * one-shot permission decisions, and option-only user questions; presentation
- * features that need a richer client stay with the harness's UI modules.
+ * one-shot permission decisions, and user questions whose menus gain an
+ * elicitation-backed free-text escape when the client advertises form
+ * elicitation; presentation features that need a richer client stay with the
+ * harness's UI modules.
  *
  * Install as a dsh plugin (`dsh plugin --profile zed add @8kugames/dsh-zed-acp`)
  * and run `dsh --profile zed`; the bundle patch disables the shipped
@@ -34,6 +36,8 @@ import {
   type CancelNotification,
   type CloseSessionRequest,
   type CloseSessionResponse,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
   type ForkSessionRequest,
   type ForkSessionResponse,
   type InitializeRequest,
@@ -193,6 +197,9 @@ export function apply(ctx: Context, config: AcpConfig): void {
   // capability _meta (the codex-acp contract); non-advertising clients keep
   // the plain tool-result content projection.
   let clientTerminalOutput = false
+  // Form elicitation is the only ACP v1 channel that carries free text, so it
+  // gates the user-questions bridge's `Other` escape and free-text forms.
+  let clientElicitationForm = false
 
   /** Return the bridge-owned record for an agent, rejecting same-id impostors. */
   const ownedRecord = (agent: Parameters<AcpSession['owns']>[0]): AcpSession | undefined => {
@@ -301,14 +308,19 @@ export function apply(ctx: Context, config: AcpConfig): void {
 
   // Structured questions (plan review, ask_user_question) ride the same
   // permission channel; unrepresentable questions delegate to the waterfall.
+  // A client advertising form elicitation also gets the free-text escape.
   ctx.on('user-questions/request', (request, next) => {
     const record = request.agent === undefined ? undefined : ownedRecord(request.agent)
     if (record === undefined) return next()
     return bridgeAcpQuestions({
       sessionId: record.agent.session.id,
+      freeTextInput: clientElicitationForm,
       drainUpdates: () => record.drainUpdates(),
       requestPermission: (params, signal) =>
         conn.request(methods.client.session.requestPermission, params,
+          signal === undefined ? undefined : { cancellationSignal: signal }),
+      elicitFreeText: (params, signal) =>
+        conn.request(methods.client.elicitation.create, params,
           signal === undefined ? undefined : { cancellationSignal: signal }),
       warn: (message) => { logger.warn(message) },
     }, request, next)
@@ -320,6 +332,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
       // the latest supported" both resolve to this server's one version.
       imagePromptEnabled = await resolveImagePromptCapability(ctx, config)
       clientTerminalOutput = params.clientCapabilities?._meta?.terminal_output === true
+      clientElicitationForm = params.clientCapabilities?.elicitation?.form != null
       return {
         protocolVersion: PROTOCOL_VERSION,
         agentInfo: { name: 'dsh-zed-acp', version: ACP_AGENT_VERSION },

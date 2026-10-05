@@ -3,6 +3,12 @@
 本项目的所有显著变更都会记录在此文件。本格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0)，
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### 新增
+
+- ask_user_question 兜底自由输入：客户端在 initialize 声明 `elicitation.form` 能力时，每个问题菜单末尾自动合成 **Other** 选项（模型自带同名标签则不重复追加），选中后经 `elicitation/create` 表单收集自由文本，答案以 `selected: ["Other"]` 加 `custom` 文本回给模型，避免列出的选项全不合理时用户被锁死；表单 decline/cancel 回到菜单重选，菜单取消仍为 `ASK_CANCELLED`，模型侧自定义的 Other 标签在能力声明下同样路由到表单，未声明时保持普通标签作答（旧版行为）。无选项问题从降级 `NO_PROVIDER` 转正为直接弹出自由文本表单；能力未声明时行为与旧版完全一致（菜单不含 Other、无选项问题照旧降级）。四个预设的 plan-mode 段补一句引导：模型应把 custom 自由文本当作用户权威答案。
+
 ## [0.3.1] - 2026-10-04
 
 后台子代理进度卡片、回收对账加固与 Turn stats 标题栏常显摘要。

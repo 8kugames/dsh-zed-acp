@@ -11,6 +11,8 @@ import {
   methods,
   ndJsonStream,
   type Agent as AcpAgent,
+  type CreateElicitationRequest,
+  type CreateElicitationResponse,
   type ForkSessionRequest,
   type ForkSessionResponse,
   type PromptRequest,
@@ -407,8 +409,10 @@ export interface BridgeHarness {
   /** The mounted stub skill registry; undefined unless the option mounted one. */
   skills: StubSkillRegistry | undefined
   permissionRequests: RequestPermissionRequest[]
+  elicitationRequests: CreateElicitationRequest[]
   persistenceRoot: string
   onPermission: (request: RequestPermissionRequest) => RequestPermissionResponse
+  onElicitation: (request: CreateElicitationRequest) => CreateElicitationResponse
   onSessionUpdateError: (() => void) | undefined
   registerCatalogProvider: (provider: string) => () => void
   replacePrimaryProviders: (providers: string[]) => void
@@ -510,6 +514,7 @@ export async function makeBridgeHarness(options: {
   const updates: CapturedUpdate[] = []
   const sessionUpdates: { sessionId: string; update: CapturedUpdate }[] = []
   const permissionRequests: RequestPermissionRequest[] = []
+  const elicitationRequests: CreateElicitationRequest[] = []
   const harness: BridgeHarness = {
     ctx,
     adapter,
@@ -517,11 +522,13 @@ export async function makeBridgeHarness(options: {
     updates,
     sessionUpdates,
     permissionRequests,
+    elicitationRequests,
     presets: stubPresets,
     permissions: stubPermissions,
     skills: stubSkills,
     persistenceRoot,
     onPermission: () => ({ outcome: { outcome: 'cancelled' } }),
+    onElicitation: () => ({ action: 'cancel' }),
     onSessionUpdateError: undefined,
     registerCatalogProvider: provider => ctx.llm.registerAdapter([provider], new MockAdapter([], false, provider)),
     replacePrimaryProviders: (providers) => { primaryAdapter.replace(providers) },
@@ -546,6 +553,10 @@ export async function makeBridgeHarness(options: {
     .onRequest(methods.client.session.requestPermission, ({ params }) => {
       permissionRequests.push(params)
       return Promise.resolve(harness.onPermission(params))
+    })
+    .onRequest(methods.client.elicitation.create, ({ params }) => {
+      elicitationRequests.push(params)
+      return Promise.resolve(harness.onElicitation(params))
     })
 
   const config = { stream: agentStream, ...options.config } as AcpConfig
