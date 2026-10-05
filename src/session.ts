@@ -46,7 +46,6 @@ import {
   foldTurnStats,
   formatStatsCard,
   statsCardTitle,
-  statsMeta,
   sumPromptTokens,
   type PriceTable,
   type SessionStats,
@@ -58,6 +57,7 @@ import {
   PLAN_MODE_ID,
   availableCommandsUpdate,
   assistantUpdates,
+  configOptionUpdate,
   contextUsage,
   currentModeUpdate,
   descendantActivityOpen,
@@ -73,6 +73,7 @@ import {
   toolCallUpdate,
   toolResultUpdate,
   turnEndToFate,
+  turnEndUsageUpdate,
   turnStatsCard,
   userMessageUpdates,
   type ProjectedToolCall,
@@ -538,7 +539,7 @@ export class AcpSession {
         this.outputTail = previous
           .then(() => this.notify({
             sessionId: this.agent.session.id,
-            update: { sessionUpdate: 'config_option_update', configOptions },
+            update: configOptionUpdate(configOptions),
           }))
           /* v8 ignore start -- the bridge notifier contains transport failure. */
           .catch((error: unknown) => {
@@ -1151,15 +1152,7 @@ export class AcpSession {
     )
     const usage = contextUsage(this.ctx, this.agent.session)
     if (usage !== undefined) {
-      updates.push({
-        sessionUpdate: 'usage_update',
-        used: usage.used,
-        size: usage.size,
-        ...(this.sessionStats.cost === undefined ? {} : {
-          cost: { amount: this.sessionStats.cost.amount, currency: this.sessionStats.cost.currency },
-        }),
-        _meta: statsMeta(stats, this.sessionStats),
-      })
+      updates.push(turnEndUsageUpdate(usage, this.sessionStats, stats))
     }
     const previous = this.outputTail
     const delivery = previous.then(async () => {

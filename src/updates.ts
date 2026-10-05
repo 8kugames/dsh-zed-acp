@@ -2,10 +2,11 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { formatTokenCount } from './stats.ts'
+import { formatTokenCount, statsMeta, type SessionStats, type TurnStats } from './stats.ts'
 import type {
   AvailableCommand,
   PlanEntry,
+  SessionConfigOption,
   SessionUpdate,
   ToolCallContent,
   ToolCallLocation,
@@ -367,13 +368,57 @@ function usageUpdate(
   event: SessionEvent<'assistant/message'>,
 ): SessionUpdate | undefined {
   if (event.data.usage === undefined) return undefined
+  return contextUsageUpdate(ctx, session)
+}
+
+/**
+ * One refresh-shaped `usage_update` carrying the meter's current context
+ * occupancy: used and size only, the same shape a mid-turn assistant message
+ * rides. The single construction site for every non-terminal usage refresh
+ * (assistant-message delivery and compaction checkpoints alike).
+ * @param ctx - bridge context carrying the token-meter service.
+ * @param session - durable session whose occupancy is measured.
+ * @returns the update, or undefined without both facts.
+ */
+export function contextUsageUpdate(ctx: Context, session: Session): SessionUpdate | undefined {
   const usage = contextUsage(ctx, session)
   if (usage === undefined) return undefined
+  return { sessionUpdate: 'usage_update', used: usage.used, size: usage.size }
+}
+
+/**
+ * The turn-end `usage_update`: fresh occupancy plus the session's cumulative
+ * cost and the machine-readable `dsh` `_meta` extension. The single
+ * construction site for the terminal usage projection.
+ * @param usage - current context occupancy facts.
+ * @param session - session-lifetime totals for the cumulative cost.
+ * @param turn - the settling turn's statistics for the `_meta` payload.
+ * @returns the completed update.
+ */
+export function turnEndUsageUpdate(
+  usage: { used: number; size: number },
+  session: SessionStats,
+  turn: TurnStats,
+): SessionUpdate {
   return {
     sessionUpdate: 'usage_update',
     used: usage.used,
     size: usage.size,
+    ...(session.cost === undefined ? {} : {
+      cost: { amount: session.cost.amount, currency: session.cost.currency },
+    }),
+    _meta: statsMeta(turn, session),
   }
+}
+
+/**
+ * Wrap one assembled option state as the standard config-option update. The
+ * single construction site for `config_option_update`.
+ * @param configOptions - the complete assembled option state.
+ * @returns the update.
+ */
+export function configOptionUpdate(configOptions: SessionConfigOption[]): SessionUpdate {
+  return { sessionUpdate: 'config_option_update', configOptions }
 }
 
 /**
