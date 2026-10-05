@@ -45,12 +45,20 @@ Every option below is optional; defaults cover a plain install. A deployment set
 ```yaml
 - id: zed-acp
   config:
-    provider: my-gateway        # with model: the exact route every new session starts on
+    provider: my-gateway # with model: the exact route every new session starts on
     model: my-model
     apiKeyEnv: MY_GATEWAY_API_KEY # credential env var `authenticate` resolves
-    sessionListPageSize: 100    # max sessions per session/list page
+    prices: # per-model rates, per 1M tokens
+      defaultCurrency: CNY # billing currency; drives the unpriced placeholder
+      models:
+        - id: my-model
+          hit: 0.01
+          miss: 0.2
+          out: 0.5
+          currency: CNY
+    sessionListPageSize: 100 # max sessions per session/list page
     modelPreferencePath: ~/.dsh/zed-acp-reasoning-efforts.json
-    imageInputs: auto           # auto | true | false
+    imageInputs: auto # auto | true | false
 ```
 
 - `provider` + `model` — when both are set, every new session starts pinned to this exact route instead of the composition's default model. Omit both to follow the composition's agent-default-model selection.
@@ -58,6 +66,7 @@ Every option below is optional; defaults cover a plain install. A deployment set
 - `sessionListPageSize` — maximum sessions one `session/list` page returns (default `100`, positive integer).
 - `modelPreferencePath` — the file reasoning-effort choices persist to across sessions (default `~/.dsh/zed-acp-reasoning-efforts.json`). Pin an absolute path when parallel installs or tests share one machine.
 - `imageInputs` — whether inline image prompts are advertised: `auto` (default) only when the route a fresh session starts on declares image input; `true` is the deployment's explicit promise for adapters whose catalog omits the declaration (the per-prompt route check still refuses unsupported routes); `false` never advertises.
+- `prices` — per-model pricing and the deployment's billing currency, so rates can be declared here instead of in the `DSH_ACP_PRICES` environment variable (no JSON-in-JSON escaping, and an invalid value fails at load rather than being dropped with a warning). `models` is a list of rows, one per served model id (`- id: …`, matching the overlay's provider-routing rows), each mapping that id to `{ hit, miss, out, currency? }` per-1M rates; ids must be unique or the schema rejects the block at load: `hit` is input served from the prefix cache, `miss` is uncached input plus cache writes, `out` is output; `currency` is an ISO 4217 code defaulting to CNY, and these flat rates apply at every hour (no peak/off-peak split). Ids are matched case-sensitively against the served id, so copy it from the model id shown in the turn-stats card title — a mismatched id is silently treated as unpriced. `defaultCurrency` (default CNY) is the currency the unpriced placeholder renders, consulted only when the session has no priced turn to learn one from — it is not the currency entries price in, and an entry's own `currency` still has its own default. Symbols come from one table shared by priced amounts and the placeholder (USD `$0.0123`, CNY `¥1.5000`, EUR `€1.5000`); a code without its own entry borrows the default currency's symbol, so a currency never has two shapes. When both `prices` and `DSH_ACP_PRICES` are set, the config block wins and the environment variable is reported as ignored in the log — including when `prices` only declares `defaultCurrency`, in which case move your rates into `prices.models` or drop the block.
 
 ## Authenticate and prompt
 

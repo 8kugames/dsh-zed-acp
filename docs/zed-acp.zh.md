@@ -45,12 +45,20 @@ Zed 以子进程方式启动 agent，并通过其 stdio 交谈 Agent Client Prot
 ```yaml
 - id: zed-acp
   config:
-    provider: my-gateway        # 与 model 一起：每个新会话起始钉定的确切路由
+    provider: my-gateway # 与 model 一起：每个新会话起始钉定的确切路由
     model: my-model
     apiKeyEnv: MY_GATEWAY_API_KEY # authenticate 握手解析的凭据环境变量
-    sessionListPageSize: 100    # 每页 session/list 返回的最大会话数
+    prices: # 各模型费率，每 1M token
+      defaultCurrency: CNY # 计价币种；决定未计价占位的形态
+      models:
+        - id: my-model
+          hit: 0.01
+          miss: 0.2
+          out: 0.5
+          currency: CNY
+    sessionListPageSize: 100 # 每页 session/list 返回的最大会话数
     modelPreferencePath: ~/.dsh/zed-acp-reasoning-efforts.json
-    imageInputs: auto           # auto | true | false
+    imageInputs: auto # auto | true | false
 ```
 
 - `provider` + `model`——两者同时设置时，每个新会话都从这条确切路由开始，而不是组合的默认模型；两者都省略则跟随组合的 agent-default-model 选择。
@@ -58,6 +66,7 @@ Zed 以子进程方式启动 agent，并通过其 stdio 交谈 Agent Client Prot
 - `sessionListPageSize`——一页 `session/list` 返回的最大会话数（默认 `100`，正整数）。
 - `modelPreferencePath`——reasoning-effort 选择跨会话持久化的文件（默认 `~/.dsh/zed-acp-reasoning-efforts.json`）。多份安装或测试共用一台机器时请钉绝对路径。
 - `imageInputs`——是否播报内联图片输入：`auto`（默认）仅当新会话起始路由声明图片输入时播报；`true` 是部署方对目录缺声明的适配器的显式承诺（逐提示的路由检查仍会拒绝不支持的路由）；`false` 从不播报。
+- `prices`——各模型费率与本部署的计价币种，可直接写在这里而不必用 `DSH_ACP_PRICES` 环境变量（免去 JSON 套 JSON 的转义，且写错时在加载期就报错，而不是记一条警告后整份丢弃）。`models` 是逐模型一行的列表（`- id: …`，与本覆盖层里 provider 路由的行形态一致），每行以 `{ hit, miss, out, currency? }` 声明该 id 的每 1M 费率；id 必须唯一，重复会在加载期被 schema 拒绝：`hit` 是命中前缀缓存的输入，`miss` 是未缓存输入加上缓存写入，`out` 是输出；`currency` 为 ISO 4217 码、缺省 CNY，这些扁平费率全时段生效（不分峰谷）。id 按大小写精确匹配，请从回合统计卡标题里的模型 id 逐字照抄——对不上会被静默当作未计价。`defaultCurrency`（缺省 CNY）是未计价占位渲染所用的币种，仅在会话还没有任何计价回合可学习币种时才被用到——它不是条目计价所用的币种，条目自身的 `currency` 有自己的缺省。金额与占位共用同一张符号表（USD `$0.0123`、CNY `¥1.5000`、EUR `€1.5000`）；未列入表的币种回落到 `defaultCurrency` 的符号，同一币种不会呈现两种形态。当 `prices` 与 `DSH_ACP_PRICES` 同时存在时以配置块为准，环境变量会在日志里被记为已忽略——包括 `prices` 只声明了 `defaultCurrency` 的情形，此时请把费率一并搬进 `prices.models`，或删掉该配置块。
 
 ## 认证并发送任务
 

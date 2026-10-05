@@ -125,19 +125,41 @@ disabled, so a deployment mounts a provider to see any skills.
 
 ## Turn statistics and cost
 
-Every ACP-prompt turn that settles normally ends with a collapsed turn-stats tool card followed — whenever the context facts are available — by a final `usage_update` carrying cumulative session cost and a machine-readable `dsh` `_meta` extension (per-turn and session-lifetime token and timing facts). The card is a synthetic read-kind tool call in the client's tool timeline — never an agent message — so it stays out of the chat stream and never enters the durable DSH session; because expansion is a client-side decision the protocol cannot force, the collapsed title strip itself carries the one-line usage summary (`in 45.2k / out 1.2k · $0.0123`, or `unpriced` for a model missing from the price table), so the facts are visible without clicking. The body renders the token split (cache read / cache write / uncached), the prefix-cache hit rate for the turn and the session (DeepSeek's hit bucket over all three input buckets), output tokens, model and tool time, average first-token latency, decode speed, and turn plus session cost. Zed keeps its native context bar on `used`/`size`; the card surfaces the facts Zed's native display does not render, and other ACP clients may ignore `_meta` per the protocol's extensibility rules. Cancelled or failed turns settle without a card.
+Every ACP-prompt turn that settles normally ends with a collapsed turn-stats tool card followed — whenever the context facts are available — by a final `usage_update` carrying cumulative session cost and a machine-readable `dsh` `_meta` extension (per-turn and session-lifetime token and timing facts). The card is a synthetic read-kind tool call in the client's tool timeline — never an agent message — so it stays out of the chat stream and never enters the durable DSH session; because expansion is a client-side decision the protocol cannot force, the collapsed title strip itself carries the one-line usage summary (`↑ 45.2k · ↓ 1.2k · $0.0123`, or a currency-styled placeholder — `$--` for USD, `¥--` for CNY, `€--` for EUR, and the default currency's symbol for any other ISO code — for a model missing from the price table), so the facts are visible without clicking. The body is a single two-column table (`metric` / `value`) rendering the token split (cache read / cache write / uncached), the prefix-cache hit rate for the turn and the session (DeepSeek's hit bucket over all three input buckets), output tokens, model and tool time, average first-token latency, decode speed, and turn plus session cost — no stray lines outside it. Zed keeps its native context bar on `used`/`size`; the card surfaces the facts Zed's native display does not render, and other ACP clients may ignore `_meta` per the protocol's extensibility rules. Cancelled or failed turns settle without a card.
 
 Definitions follow dsh's own statistics (`dsh-token-meter` buckets and the harness UI's session stats). dsh maps `TokenUsage.inputTokens` onto its own `uncachedInputTokens`, so the uncached-input figure is never netted against cache reads, and the three prompt buckets are disjoint. Model time is `step/start → assistant/message` per model call; tool time is `tool/call → tool/result`; TTFT is `step/start → first token delta`; and output speed is `first token delta → assistant/message` computed over the steps that recorded **both** that window and their output tokens, so a step without stream timing contributes no rate instead of skewing one. All timings come from committed event times, not projection-time sampling, so they are identical on replay.
 
-Cost uses DeepSeek's published list prices (USD per 1M tokens, checked 2026-09): `deepseek-flash` peak $0.006 hit / $0.3 miss / $1.2 out and `deepseek-v4-pro` peak $0.044 / $1.32 / $3.96, with off-peak hours billed at exactly half (peak = 01:00–04:00 and 06:00–10:00 UTC, weekdays). Retired ids `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` resolve to `deepseek-flash`. Cache writes bill at the miss rate, matching DeepSeek's billing. The Chinese-public-holiday exclusion is not modeled; unlisted models report no cost.
+Cost uses DeepSeek's published list prices (CNY per 1M tokens, from https://api-docs.deepseek.com/zh-cn/quick_start/pricing/): `deepseek-flash` peak ¥0.04 hit / ¥2 miss / ¥8 out and `deepseek-v4-pro` peak ¥0.3 / ¥9 / ¥27, with off-peak hours billed at exactly half (peak = 09:00–12:00 and 14:00–18:00 Beijing time, weekdays). Retired ids `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp` resolve to `deepseek-flash`. Cache writes bill at the miss rate, matching DeepSeek's billing. The Chinese-public-holiday exclusion is not modeled; unlisted models report no cost.
 
-Override or extend pricing with `DSH_ACP_PRICES`, a JSON object of flat per-1M rates (these apply at every hour and shadow the built-in tiers for the same id):
+Declare pricing in the plugin's `prices` config block, on the `zed-acp` row of the profile overlay — no escaping, and an invalid value fails at load instead of being dropped:
 
-```json
-{ "my-model": { "hit": 0.01, "miss": 0.2, "out": 0.5, "currency": "CNY" } }
+```yaml
+- id: zed-acp
+  config:
+    prices:
+      defaultCurrency: CNY
+      models:
+        - id: my-model
+          hit: 0.01
+          miss: 0.2
+          out: 0.5
+          currency: CNY
+        - id: my-other-model
+          hit: 0.1
+          miss: 1
+          out: 2
+          currency: CNY
 ```
 
-Malformed values are ignored with a logged warning. Cumulative totals cover live turns since the agent process opened the session — resuming a session or restarting Zed starts a fresh tally. Cancelled and failed turns settle without the final update.
+`models` is a list of rows, one per served model id — the same `- id: …` shape the provider routes in _Custom, non-DeepSeek models_ below use. Ids must be unique; a duplicated id fails the schema at load.
+
+Rates are per 1M tokens: `hit` is input served from the prefix cache, `miss` is uncached input plus cache writes, `out` is output. Flat rates apply at every hour (no peak/off-peak split) and shadow the built-in tiers for the same id. An entry's `currency` is an ISO 4217 code defaulting to CNY, matching the built-in prices; write `USD` explicitly for dollar-denominated rates. `defaultCurrency` (default CNY) is the currency the unpriced placeholder renders, consulted only when the session has no priced turn to learn one from: CNY renders `¥--`, USD `$--`, EUR `€--`. Priced amounts use the same symbols — `$0.0123`, `¥1.5000`, `€1.5000`. A code without its own entry borrows the default currency's symbol, falling back to the code form only when the default itself has none — so one currency never has two shapes. Types and non-negative rates are rejected by the plugin schema at load, while a bad currency code or an unknown key is rejected by the price parser; both stop the plugin from starting rather than being silently dropped.
+
+**Model ids are matched case-sensitively against the served id.** Copy the id from the model shown in the turn-stats card title: a mismatched id is silently treated as unpriced, which is the most common reason cost stays empty.
+
+`DSH_ACP_PRICES` remains supported for deployments that already use it — a JSON object of the same flat rates plus a top-level `$defaultCurrency` meta key (its keys are `$`-prefixed precisely so they are never read as model ids). In that path a malformed value is **all-or-nothing**: the whole document is dropped, the built-in table stands, and one `DSH_ACP_PRICES ignored: …` warning is logged. When both sources are set, the `prices` block wins and the environment variable is reported as ignored.
+
+Cumulative totals cover live turns since the agent process opened the session — resuming a session or restarting Zed starts a fresh tally. Cancelled and failed turns settle without the final update.
 
 ## Compatibility
 

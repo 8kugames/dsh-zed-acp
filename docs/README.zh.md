@@ -86,19 +86,41 @@ skills 不需要派发——`/skill-name` 是 harness 自己的调用手势，br
 
 ## 回合统计与费用
 
-每个正常收尾的 ACP 提问回合，都会以一张折叠的回合统计工具卡收束；当上下文事实可得时，其后再跟一条携带累计会话费用与机器可读 `dsh` `_meta` 扩展（回合与会话两级的 token 与时序事实）的最终 `usage_update`。卡片是一次合成的只读工具调用，落在客户端的工具时间线里而非消息流，不进入 DSH 持久会话；由于展开与否是客户端单方决定、协议无法强制，折叠可见的标题栏本身携带一行用量摘要（`in 45.2k / out 1.2k · $0.0123`，价表外模型显示 `unpriced`），无需点开即可看到关键事实。卡片正文为输入三桶拆分（缓存读/缓存写/未缓存）、前缀缓存命中率（回合与会话两级，命中桶占三桶输入之和的比例）、输出 token、模型与工具用时、平均首 token 延迟、解码速度、本轮与累计会话费用。Zed 的原生上下文条继续用 `used`/`size`；卡片补足 Zed 原生展示不渲染的事实，其他 ACP 客户端可依协议扩展性规则忽略 `_meta`。取消或失败的回合不发送卡片。
+每个正常收尾的 ACP 提问回合，都会以一张折叠的回合统计工具卡收束；当上下文事实可得时，其后再跟一条携带累计会话费用与机器可读 `dsh` `_meta` 扩展（回合与会话两级的 token 与时序事实）的最终 `usage_update`。卡片是一次合成的只读工具调用，落在客户端的工具时间线里而非消息流，不进入 DSH 持久会话；由于展开与否是客户端单方决定、协议无法强制，折叠可见的标题栏本身携带一行用量摘要（`↑ 45.2k · ↓ 1.2k · $0.0123`，价表外模型显示币种样式占位——USD 为 `$--`、CNY 为 `¥--`、EUR 为 `€--`、其余 ISO 码回落到 `defaultCurrency` 的符号），无需点开即可看到关键事实。卡片正文是一张两列表（列名 `metric` / `value`），逐行收拢输入三桶拆分（缓存读/缓存写/未缓存）、前缀缓存命中率（回合与会话两级，命中桶占三桶输入之和的比例）、输出 token、模型与工具用时、平均首 token 延迟、解码速度、本轮与累计会话费用——表外不再有散行。Zed 的原生上下文条继续用 `used`/`size`；卡片补足 Zed 原生展示不渲染的事实，其他 ACP 客户端可依协议扩展性规则忽略 `_meta`。取消或失败的回合不发送卡片。
 
 口径完全沿用 dsh 自身统计（`dsh-token-meter` 分桶与 harness UI 的会话统计）：dsh 把 `TokenUsage.inputTokens` 映射为自己的 `uncachedInputTokens`，因此未缓存输入不会被再去减缓存读取，三个输入桶互斥；模型用时为每次模型调用的 `step/start → assistant/message`，工具用时为 `tool/call → tool/result`，TTFT 为 `step/start → 首个 token delta`，输出速度为 `首个 token delta → assistant/message`，且只在**同时**记录了该窗口与该步输出 token 的步骤上计算，因此没有流式时刻的步骤不贡献速度值、也不拉偏结果。所有时序都来自已提交事件的时间戳，而非投影时刻采样，因此重放时数值一致。
 
-费用采用 DeepSeek 公布价（每 1M token、USD，2026-09 核对）：`deepseek-flash` 峰时 $0.006 命中 / $0.3 未命中 / $1.2 输出，`deepseek-v4-pro` 峰时 $0.044 / $1.32 / $3.96，谷时按峰时减半计费（峰时 = UTC 周一至周五 01:00–04:00 与 06:00–10:00）。已退役的 `deepseek-v4-flash`、`deepseek-v4-flash-vision-exp` 解析到 `deepseek-flash`。缓存写按未命中价计费，与 DeepSeek 计费一致。中国法定节假日的峰时豁免未建模；未列出的模型不报费用。
+费用采用 DeepSeek 公布价（每 1M token、CNY，取自 https://api-docs.deepseek.com/zh-cn/quick_start/pricing/）：`deepseek-flash` 峰时 ¥0.04 命中 / ¥2 未命中 / ¥8 输出，`deepseek-v4-pro` 峰时 ¥0.3 / ¥9 / ¥27，谷时按峰时减半计费（峰时 = 北京时间周一至周五 09:00–12:00 与 14:00–18:00）。已退役的 `deepseek-v4-flash`、`deepseek-v4-flash-vision-exp` 解析到 `deepseek-flash`。缓存写按未命中价计费，与 DeepSeek 计费一致。中国法定节假日的峰时豁免未建模；未列出的模型不报费用。
 
-用 `DSH_ACP_PRICES` 覆盖或扩充价目，值为扁平每 1M 费率的 JSON 对象（全时段生效，同 id 时遮蔽内置分时价）：
+把价目写在插件配置的 `prices` 块里（profile 覆盖文件的 `zed-acp` 行）——无需转义，写错时在加载期就报错而不是被丢弃：
 
-```json
-{ "my-model": { "hit": 0.01, "miss": 0.2, "out": 0.5, "currency": "CNY" } }
+```yaml
+- id: zed-acp
+  config:
+    prices:
+      defaultCurrency: CNY
+      models:
+        - id: my-model
+          hit: 0.01
+          miss: 0.2
+          out: 0.5
+          currency: CNY
+        - id: my-other-model
+          hit: 0.1
+          miss: 1
+          out: 2
+          currency: CNY
 ```
 
-格式非法时忽略并记录警告。累计值只覆盖 agent 进程打开该会话以来的活跃回合——恢复会话或重启 Zed 后重新计数。取消与失败的回合不发出该更新。
+`models` 是逐模型一行的列表，与下文「自配非 DeepSeek 模型」一节里 provider 路由的 `- id: …` 形态一致。每个 id 必须唯一，重复会在加载期被 schema 拒绝。
+
+费率单位为每 1M token：`hit` 是命中前缀缓存的输入，`miss` 是未缓存输入加上缓存写入，`out` 是输出。扁平费率全时段生效（不分峰谷），并在同 id 时遮蔽内置分时价。条目自身的 `currency` 为 ISO 4217 码、缺省 CNY（与内置价目一致），需要美元时请显式写 `currency: USD`。`defaultCurrency`（缺省 CNY）是未计价占位渲染所用的币种，仅在会话还没有任何计价回合可学习币种时才被用到：CNY 渲染 `¥--`、USD `$--`、EUR `€--`。已计价金额沿用同一套符号——`$0.0123`、`¥1.5000`、`€1.5000`。未列入符号表的币种回落到 `defaultCurrency` 的符号（缺省 CNY 即 `¥`），只有当 `defaultCurrency` 本身也无符号时才以码后缀呈现——同一币种因此不会呈现两种形态。类型与非负费率由插件 schema 在加载期拒绝，非法币种码与未知键由价目解析拒绝；两者都会让插件起不来，而不是被静默丢弃。
+
+**模型 id 按大小写精确匹配服务侧的 id。** 请从回合统计卡标题里显示的模型 id 逐字照抄：对不上会被静默当作未计价，这也是费用长期为空最常见的原因。
+
+已在使用 `DSH_ACP_PRICES` 的部署可继续沿用——它是一个承载同样扁平费率的 JSON 对象，并可带顶层元键 `$defaultCurrency`（该路径的键以 `$` 前缀，正是为了保证永远不会被当作模型 id 读取）。这条路径的非法值是**全有或全无**：整份文档被丢弃、回退内置价表，并记一条 `DSH_ACP_PRICES ignored: …` 警告。两个来源同时存在时以 `prices` 块为准，环境变量会被记为已忽略。
+
+累计值只覆盖 agent 进程打开该会话以来的活跃回合——恢复会话或重启 Zed 后重新计数。取消与失败的回合不发出该更新。
 
 ## 兼容性
 

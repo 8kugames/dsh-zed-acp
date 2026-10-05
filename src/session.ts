@@ -1167,8 +1167,13 @@ export class AcpSession {
         inputTokens: sumPromptTokens(stats.usage),
         outputTokens: stats.usage.outputTokens,
         cost: stats.cost,
+        // The unpriced placeholder follows the currency the session is known to
+        // be billed in; with no priced turn to learn one from, the deployment's
+        // configured default stands in (CNY when it names none).
+        fallbackCurrency: this.sessionStats.cost?.currency ?? this.prices.defaultCurrency,
+        defaultCurrency: this.prices.defaultCurrency,
       }),
-      formatStatsCard(stats, this.sessionStats, modelId),
+      formatStatsCard(stats, this.sessionStats, modelId, this.prices.defaultCurrency),
     )
     const usage = contextUsage(this.ctx, this.agent.session)
     if (usage !== undefined) {

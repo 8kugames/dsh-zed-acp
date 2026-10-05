@@ -91,7 +91,7 @@ import {
   type AcpSteeringRequest,
 } from './steering.ts'
 import { AcpSession } from './session.ts'
-import { buildPriceTable } from './stats.ts'
+import { resolvePriceTable, type ConfigPrice, type PriceConfig } from './stats.ts'
 import { ACP_AGENT_VERSION } from './version.ts'
 
 const DEFAULT_SESSION_LIST_PAGE_SIZE = 100
@@ -141,9 +141,29 @@ export interface AcpConfig {
    * route at admission time; `false` never advertises them.
    */
   imageInputs?: 'auto' | boolean
+  /**
+   * Per-model pricing and the currency the unpriced placeholder renders, so
+   * rates can be declared here instead of in the `DSH_ACP_PRICES` environment
+   * variable. Model ids are matched exactly, so they must match the served id
+   * case-sensitively. Takes precedence over `DSH_ACP_PRICES` when both are set.
+   */
+  prices?: PriceConfig
   /** Runtime-only transport override; production uses stdio. */
   stream?: Stream
 }
+
+const ModelPriceSchema: Schema<ConfigPrice> = Schema.object({
+  id: Schema.string().required(),
+  hit: Schema.number().min(0).required(),
+  miss: Schema.number().min(0).required(),
+  out: Schema.number().min(0).required(),
+  currency: Schema.string(),
+})
+
+const PriceConfigSchema: Schema<PriceConfig> = Schema.object({
+  defaultCurrency: Schema.string(),
+  models: Schema.array(ModelPriceSchema),
+})
 
 export const Config: Schema<AcpConfig> = Schema.object({
   provider: Schema.string(),
@@ -152,6 +172,7 @@ export const Config: Schema<AcpConfig> = Schema.object({
   sessionListPageSize: Schema.natural().min(1).default(DEFAULT_SESSION_LIST_PAGE_SIZE),
   modelPreferencePath: Schema.string(),
   imageInputs: Schema.union([Schema.const('auto'), Schema.boolean()]).default('auto'),
+  prices: PriceConfigSchema,
 })
 
 /**
@@ -190,7 +211,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
   const apiKeyRef = resolveApiKeyRef(config.apiKeyEnv)
   const sessions = new Map<SessionId, AcpSession>()
   const activating = new Set<SessionId>()
-  const prices = buildPriceTable(process.env.DSH_ACP_PRICES, (message) => { logger.warn(message) })
+  const prices = resolvePriceTable(config.prices, process.env.DSH_ACP_PRICES, (message) => { logger.warn(message) })
   const preferenceStore = createReasoningPreferenceStore(config.modelPreferencePath ?? defaultReasoningPreferencePath())
   let closed = false
   let imagePromptEnabled = false

@@ -5,6 +5,7 @@ import { MessageId, type AssistantStreamRecord, type TokenUsage } from '@deepsee
 import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { makeBridgeHarness, textResponse, type BridgeHarness } from './harness.ts'
+import { Config } from '../src/index.ts'
 import {
   DEEPSEEK_PRICE_TABLE,
   TurnStatsCollector,
@@ -15,9 +16,11 @@ import {
   formatTokenCount,
   isPeakUtcTime,
   mergePriceOverrides,
-  parsePriceOverrides,
+  parsePriceDocument,
+  priceDocumentFromConfig,
   priceUsage,
   resolvePrice,
+  resolvePriceTable,
   statsCardTitle,
   statsMeta,
   type SessionStats,
@@ -124,9 +127,9 @@ describe('turn statistics collection', () => {
 
   it('prices listed models per model call and reports no cost for unlisted ones', () => {
     const priced = collectTwoStepTurn()
-    // flash peak: call 1 = 800·0.006 hit + (1000+100)·0.3 miss + 50·1.2 out;
-    // call 2 = 1200·0.3 + 30·1.2.
-    expect(priced?.cost).toEqual({ amount: 0.000791, currency: 'USD' })
+    // flash peak: call 1 = 800·0.04 hit + (1000+100)·2 miss + 50·8 out;
+    // call 2 = 1200·2 + 30·8.
+    expect(priced?.cost).toEqual({ amount: 0.005272, currency: 'CNY' })
 
     const unpriced = collectTwoStepTurn(DEEPSEEK_PRICE_TABLE, 'mock')
     expect(unpriced?.cost).toBeUndefined()
@@ -175,9 +178,9 @@ describe('DeepSeek list pricing', () => {
 
   it('bills tiered models at peak rates and exactly half off-peak', () => {
     const peak = resolvePrice(DEEPSEEK_PRICE_TABLE, 'deepseek-flash', PEAK_MS)
-    expect(peak).toEqual({ rates: { hit: 0.006, miss: 0.3, out: 1.2 }, currency: 'USD' })
+    expect(peak).toEqual({ rates: { hit: 0.04, miss: 2, out: 8 }, currency: 'CNY' })
     const offPeak = resolvePrice(DEEPSEEK_PRICE_TABLE, 'deepseek-flash', OFF_PEAK_MS)
-    expect(offPeak).toEqual({ rates: { hit: 0.003, miss: 0.15, out: 0.6 }, currency: 'USD' })
+    expect(offPeak).toEqual({ rates: { hit: 0.02, miss: 1, out: 4 }, currency: 'CNY' })
   })
 
   it('resolves retired aliases and leaves unknown models unpriced', () => {
@@ -188,30 +191,58 @@ describe('DeepSeek list pricing', () => {
   })
 
   it('prices cache reads at the hit rate and uncached plus writes at the miss rate', () => {
-    const rates = { hit: 0.006, miss: 0.3, out: 1.2 }
+    const rates = { hit: 0.04, miss: 2, out: 8 }
     // `inputTokens` is already uncached input: it is never netted against cache.
     expect(priceUsage(rates, { inputTokens: 1_000, outputTokens: 50, cacheReadTokens: 800 }))
-      .toBeCloseTo(0.0003648, 10)
+      .toBeCloseTo(0.002432, 10)
     expect(priceUsage(rates, { inputTokens: 300, outputTokens: 0, cacheWriteTokens: 200 }))
-      .toBeCloseTo(0.00015, 10)
+      .toBeCloseTo(0.001, 10)
   })
 })
 
 describe('DSH_ACP_PRICES overrides', () => {
   it('parses flat entries and lets them shadow tiered and unknown models', () => {
-    const overrides = parsePriceOverrides('{"my-model":{"hit":0.1,"miss":1,"out":2,"currency":"CNY"}}')
-    const table = mergePriceOverrides(DEEPSEEK_PRICE_TABLE, overrides)
+    const doc = parsePriceDocument('{"my-model":{"hit":0.1,"miss":1,"out":2,"currency":"CNY"}}')
+    const table = mergePriceOverrides(DEEPSEEK_PRICE_TABLE, doc)
     expect(resolvePrice(table, 'my-model', PEAK_MS)).toEqual({ rates: { hit: 0.1, miss: 1, out: 2 }, currency: 'CNY' })
-    const replaced = parsePriceOverrides('{"deepseek-flash":{"hit":0,"miss":0,"out":0}}')
+    const replaced = parsePriceDocument('{"deepseek-flash":{"hit":0,"miss":0,"out":0}}')
     const zeroed = mergePriceOverrides(DEEPSEEK_PRICE_TABLE, replaced)
     expect(resolvePrice(zeroed, 'deepseek-flash', PEAK_MS)?.rates.miss).toBe(0)
   })
 
   it('rejects malformed documents with a descriptive error', () => {
-    expect(() => parsePriceOverrides('[]')).toThrow(/object/)
-    expect(() => parsePriceOverrides('{"m":{"hit":"x","miss":1,"out":1}}')).toThrow(/hit/)
-    expect(() => parsePriceOverrides('{"m":{"hit":1,"miss":1,"out":1,"currency":"dollars"}}')).toThrow(/currency/)
-    expect(() => parsePriceOverrides('not json')).toThrow()
+    expect(() => parsePriceDocument('[]')).toThrow(/object/)
+    expect(() => parsePriceDocument('{"m":{"hit":"x","miss":1,"out":1}}')).toThrow(/hit/)
+    expect(() => parsePriceDocument('{"m":{"hit":1,"miss":1,"out":1,"currency":"dollars"}}')).toThrow(/currency/)
+    expect(() => parsePriceDocument('not json')).toThrow()
+  })
+
+  it('reads the $defaultCurrency meta key and rejects other meta keys', () => {
+    expect(parsePriceDocument('{"$defaultCurrency":"CNY"}').defaultCurrency).toBe('CNY')
+    expect(parsePriceDocument('{"$defaultCurrency":"USD"}').defaultCurrency).toBe('USD')
+    // Unset means CNY: dollar billing is opt-in through the meta key.
+    expect(parsePriceDocument('{"m":{"hit":1,"miss":1,"out":1}}').defaultCurrency).toBe('CNY')
+    const empty = parsePriceDocument('{}')
+    expect([...empty.entries]).toEqual([])
+    expect(empty.defaultCurrency).toBe('CNY')
+    expect(DEEPSEEK_PRICE_TABLE.defaultCurrency).toBe('CNY')
+    const mixed = parsePriceDocument('{"$defaultCurrency":"CNY","m":{"hit":1,"miss":1,"out":1}}')
+    expect(mixed.defaultCurrency).toBe('CNY')
+    expect([...mixed.entries.keys()]).toEqual(['m'])
+    expect(() => parsePriceDocument('{"$defaultCurrency":"yuan"}')).toThrow(/ISO 4217/)
+    expect(() => parsePriceDocument('{"$defaultCurrency":7}')).toThrow(/ISO 4217/)
+    expect(() => parsePriceDocument('{"$other":"CNY"}')).toThrow(/unknown meta key/)
+  })
+
+  it('carries the configured default currency into the built table without repricing entries', () => {
+    const table = buildPriceTable(
+      '{"$defaultCurrency":"CNY","my-model":{"hit":0.1,"miss":1,"out":2}}',
+      (message) => { throw new Error(`unexpected warning: ${message}`) },
+    )
+    expect(table.defaultCurrency).toBe('CNY')
+    // The meta key names the deployment's placeholder currency only: an entry
+    // that omits `currency` still bills in its own default.
+    expect(resolvePrice(table, 'my-model', PEAK_MS)?.currency).toBe('CNY')
   })
 
   it('builds the default table for absent values and warns for malformed ones', () => {
@@ -226,7 +257,7 @@ describe('DSH_ACP_PRICES overrides', () => {
 
 describe('mixed-currency cost accounting', () => {
   /** Flat table pricing two mock models in two different currencies. */
-  const mixedTable = mergePriceOverrides(DEEPSEEK_PRICE_TABLE, parsePriceOverrides(
+  const mixedTable = mergePriceOverrides(DEEPSEEK_PRICE_TABLE, parsePriceDocument(
     '{"usd-model":{"hit":0,"miss":1,"out":0,"currency":"USD"},"eur-model":{"hit":0,"miss":1,"out":0,"currency":"EUR"}}',
   ))
 
@@ -306,7 +337,7 @@ describe('stats presentation', () => {
     const folded = foldTurnStats(emptySessionStats(), stats)
     expect(folded.usage).toEqual(stats.usage)
     expect(folded.timing).toEqual(stats.timing)
-    expect(folded.cost).toEqual({ amount: 0.000791, currency: 'USD' })
+    expect(folded.cost).toEqual({ amount: 0.005272, currency: 'CNY' })
     const twice = foldTurnStats(folded, stats)
     expect(twice.usage).toMatchObject({ uncachedInputTokens: 4_400, outputTokens: 160, modelCalls: 4 })
     expect(twice.timing).toMatchObject({ llmMs: 6_400, toolMs: 1_000, decodeTokens: 160, ttftCalls: 4 })
@@ -455,18 +486,21 @@ describe('formatStatsCard', () => {
       cost: { amount: 0.0123, currency: 'USD' },
     }
     const session: SessionStats = foldTurnStats(emptySessionStats(), turn)
-    const card = formatStatsCard(turn, session, 'deepseek-chat')
+    const card = formatStatsCard(turn, session, 'deepseek-chat', 'CNY')
 
-    expect(card).toContain('**Turn stats · deepseek-chat** — llm 3.2s · tools 1.4s')
+    expect(card).toContain('**Turn stats · deepseek-chat**')
     expect(card).toContain('| Input · cache read | 9,000 |')
     expect(card).toContain('| Input · cache write | 500 |')
     expect(card).toContain('| Input · uncached | 1,000 |')
     expect(card).toContain('| Output | 400 |')
-    expect(card).toContain('cache hit 85.7% · session cache hit 85.7%')
-    expect(card).toContain('avg first token 320ms')
-    expect(card).toContain('decode 200.0 tok/s')
-    expect(card).toContain('turn $0.0123')
-    expect(card).toContain('session $0.0123')
+    expect(card).toContain('| cache hit | 85.7% |')
+    expect(card).toContain('| session cache hit | 85.7% |')
+    expect(card).toContain('| model time | 3.2s |')
+    expect(card).toContain('| tool time | 1.4s |')
+    expect(card).toContain('| avg first token | 320ms |')
+    expect(card).toContain('| decode speed | 200.0 tok/s |')
+    expect(card).toContain('| turn cost | $0.0123 |')
+    expect(card).toContain('| session cost | $0.0123 |')
   })
 
   it('omits absent cache rows and ungated timing or cost segments', () => {
@@ -476,9 +510,11 @@ describe('formatStatsCard', () => {
       timing: { llmMs: 900, toolMs: 0, decodeMs: 0, decodeTokens: 0, ttftSumMs: 0, ttftCalls: 0 },
       cost: undefined,
     }
-    const card = formatStatsCard(turn, emptySessionStats(), undefined)
+    const card = formatStatsCard(turn, emptySessionStats(), undefined, 'CNY')
 
-    expect(card).toContain('**Turn stats** — llm 900ms · tools 0ms')
+    expect(card).toContain('**Turn stats**')
+    expect(card).toContain('| model time | 900ms |')
+    expect(card).toContain('| tool time | 0ms |')
     expect(card).not.toContain('cache read')
     expect(card).not.toContain('cache write')
     expect(card).not.toContain('cache hit')
@@ -487,16 +523,22 @@ describe('formatStatsCard', () => {
     expect(card).not.toContain('$')
   })
 
-  it('suffices non-USD cost currencies with their code', () => {
-    const turn: TurnStats = {
-      turn: 3,
-      usage: { uncachedInputTokens: 10, outputTokens: 2, modelCalls: 1 },
-      timing: { llmMs: 100, toolMs: 0, decodeMs: 0, decodeTokens: 0, ttftSumMs: 0, ttftCalls: 0 },
-      cost: { amount: 1.5, currency: 'EUR' },
+  it('symbol-codes the currencies it knows and suffixes the rest', () => {
+    const priced = (currency: string): string => {
+      const turn: TurnStats = {
+        turn: 3,
+        usage: { uncachedInputTokens: 10, outputTokens: 2, modelCalls: 1 },
+        timing: { llmMs: 100, toolMs: 0, decodeMs: 0, decodeTokens: 0, ttftSumMs: 0, ttftCalls: 0 },
+        cost: { amount: 1.5, currency },
+      }
+      const session: SessionStats = foldTurnStats(emptySessionStats(), turn)
+      return formatStatsCard(turn, session, undefined, 'CNY')
     }
-    const session: SessionStats = foldTurnStats(emptySessionStats(), turn)
-
-    expect(formatStatsCard(turn, session, undefined)).toContain('turn 1.5000 EUR · session 1.5000 EUR')
+    // Known codes use their own symbol; unknown ones borrow the default's.
+    expect(priced('USD')).toContain('| turn cost | $1.5000 |')
+    expect(priced('CNY')).toContain('| turn cost | ¥1.5000 |')
+    expect(priced('EUR')).toContain('| turn cost | €1.5000 |')
+    expect(priced('JPY')).toContain('| turn cost | ¥1.5000 |')
   })
 })
 
@@ -506,12 +548,21 @@ describe('collapsed title strip summary', () => {
       inputTokens: 45_200,
       outputTokens: 1_234,
       cost: { amount: 0.0123, currency: 'USD' },
-    })).toBe('Turn stats · deepseek-flash · in 45.2k / out 1.2k · $0.0123')
+      fallbackCurrency: 'CNY',
+      defaultCurrency: 'CNY',
+    })).toBe('Turn stats · deepseek-flash · ↑ 45.2k · ↓ 1.2k · $0.0123')
   })
 
-  it('names unpriced models instead of silently dropping the cost segment', () => {
-    expect(statsCardTitle('glm-5.3-flash', { inputTokens: 980, outputTokens: 42, cost: undefined }))
-      .toBe('Turn stats · glm-5.3-flash · in 980 / out 42 · unpriced')
+  it('renders the unpriced placeholder in the fallback currency', () => {
+    const unpriced = (fallbackCurrency: string, defaultCurrency = 'CNY'): string =>
+      statsCardTitle('glm-5.3-flash', { inputTokens: 980, outputTokens: 42, cost: undefined, fallbackCurrency, defaultCurrency })
+    expect(unpriced('CNY')).toBe('Turn stats · glm-5.3-flash · ↑ 980 · ↓ 42 · ¥--')
+    expect(unpriced('USD')).toBe('Turn stats · glm-5.3-flash · ↑ 980 · ↓ 42 · $--')
+    expect(unpriced('EUR')).toBe('Turn stats · glm-5.3-flash · ↑ 980 · ↓ 42 · €--')
+    // Unknown codes borrow the default currency's symbol instead of a code suffix.
+    expect(unpriced('JPY')).toBe('Turn stats · glm-5.3-flash · ↑ 980 · ↓ 42 · ¥--')
+    // When even the default has no symbol, the code form is the last resort.
+    expect(unpriced('JPY', 'JPY')).toBe('Turn stats · glm-5.3-flash · ↑ 980 · ↓ 42 · -- JPY')
     expect(statsCardTitle(undefined)).toBe('Turn stats')
     expect(statsCardTitle('deepseek-flash')).toBe('Turn stats · deepseek-flash')
   })
@@ -525,5 +576,194 @@ describe('collapsed title strip summary', () => {
     expect(formatTokenCount(999_950)).toBe('1M')
     expect(formatTokenCount(999_950_000)).toBe('1B')
     expect(formatTokenCount(250_000_000)).toBe('250M')
+  })
+})
+
+describe('plugin-config price source', () => {
+  it('accepts a prices block and rejects malformed rates and currencies at load', () => {
+    expect(Config({ prices: { defaultCurrency: 'CNY', models: [{ id: 'my-model', hit: 0.1, miss: 1, out: 2 }] } }).prices)
+      .toMatchObject({ defaultCurrency: 'CNY', models: [{ id: 'my-model', hit: 0.1, miss: 1, out: 2 }] })
+    // Missing rate, negative rate, non-numeric rate, non-string currency: all
+    // must fail at load. The casts reach runtime validation past the types.
+    expect(() => Config({ prices: { models: [{ id: 'm', hit: 0, miss: 1 }] } } as never)).toThrow()
+    expect(() => Config({ prices: { models: [{ id: 'm', hit: 0, miss: -1, out: 1 }] } } as never)).toThrow()
+    expect(() => Config({ prices: { models: [{ id: 'm', hit: 'free', miss: 1, out: 1 }] } } as never)).toThrow()
+    expect(() => Config({ prices: { models: [{ id: 'm', hit: 0, miss: 1, out: 1, currency: 5 }] } } as never)).toThrow()
+  })
+
+  it('builds a price document from config, defaulting currency like the env path', () => {
+    const doc = priceDocumentFromConfig({ models: [{ id: 'my-model', hit: 0.1, miss: 1, out: 2 }] })
+    expect(doc.defaultCurrency).toBe('CNY')
+    expect(doc.entries.get('my-model')).toEqual({ hit: 0.1, miss: 1, out: 2, currency: 'CNY' })
+    // A config id needs no `$` escaping and is matched verbatim.
+    const dollar = priceDocumentFromConfig({ defaultCurrency: 'USD', models: [{ id: '$weird-id', hit: 0, miss: 0, out: 0 }] })
+    expect(dollar.defaultCurrency).toBe('USD')
+    expect([...dollar.entries.keys()]).toEqual(['$weird-id'])
+    expect(() => priceDocumentFromConfig({ defaultCurrency: 'cny' })).toThrow(/ISO 4217/)
+  })
+
+  it('prefers the config block and reports the shadowed env document', () => {
+    const warnings: string[] = []
+    const table = resolvePriceTable(
+      { defaultCurrency: 'USD', models: [{ id: 'env-model', hit: 9, miss: 9, out: 9 }] },
+      '{"env-model":{"hit":1,"miss":1,"out":1}}',
+      (message) => { warnings.push(message) },
+    )
+    expect(table.defaultCurrency).toBe('USD')
+    // The config entry wins, not the shadowed env entry.
+    expect(resolvePrice(table, 'env-model', PEAK_MS)?.rates.miss).toBe(9)
+    expect(warnings).toEqual([expect.stringMatching(/DSH_ACP_PRICES ignored/)])
+  })
+
+  it('rejects misspelled keys the schema would silently keep', () => {
+    // The schema types an unknown key as present-but-ignored, so a typo must
+    // fail here or the deployment silently keeps the default currency.
+    expect(() => Config({ prices: { defaultCurrencyy: 'USD' } } as never)).not.toThrow()
+    expect(() => priceDocumentFromConfig({ defaultCurrencyy: 'USD' } as never)).toThrow(/unknown prices key/)
+    expect(() => priceDocumentFromConfig({
+      models: [{ id: 'm', hit: 0, miss: 1, out: 1, currancy: 'CNY' }],
+    } as never)).toThrow(/unknown field "currancy"/)
+  })
+
+  it('lets a currency-only block shadow the env rates, and says so', () => {
+    // Declaring only `defaultCurrency` still wins over the env document, so the
+    // warning must point at the migration rather than merely reporting a win.
+    const warnings: string[] = []
+    const table = resolvePriceTable(
+      { defaultCurrency: 'USD' },
+      '{"env-model":{"hit":1,"miss":1,"out":1}}',
+      (message) => { warnings.push(message) },
+    )
+    expect(table.defaultCurrency).toBe('USD')
+    expect(resolvePrice(table, 'env-model', PEAK_MS)).toBeUndefined()
+    expect(warnings).toHaveLength(1)
+    expect(warnings[0]).toMatch(/prices\.models/)
+  })
+
+  it('falls back to the env document when the config block declares nothing', () => {
+    const warnings: string[] = []
+    const table = resolvePriceTable(
+      { models: [] },
+      '{"env-model":{"hit":2,"miss":3,"out":4,"currency":"EUR"}}',
+      (message) => { warnings.push(message) },
+    )
+    expect(resolvePrice(table, 'env-model', PEAK_MS)?.currency).toBe('EUR')
+    expect(warnings).toEqual([])
+    // With no config and no env, the built-in table stands.
+    expect(resolvePriceTable(undefined, undefined, (message) => { throw new Error(`unexpected: ${message}`) }))
+      .toBe(DEEPSEEK_PRICE_TABLE)
+  })
+})
+
+describe('unpriced placeholder currency wiring', () => {
+  let harness: BridgeHarness | undefined
+  const configured = process.env.DSH_ACP_PRICES
+
+  afterEach(async () => {
+    await harness?.dispose()
+    harness = undefined
+    if (configured === undefined) delete process.env.DSH_ACP_PRICES
+    else process.env.DSH_ACP_PRICES = configured
+  })
+
+  /** The collapsed card title of one settled turn, by its turn number. */
+  function cardTitle(turn: number): string {
+    const call = harness?.updates.find(update => update.sessionUpdate === 'tool_call'
+      && 'toolCallId' in update && update.toolCallId === `dsh-stats-${turn}`)
+    if (call === undefined || !('title' in call)) throw new Error(`expected the card title of turn ${turn}`)
+    return call.title ?? ''
+  }
+
+  /** Open a session on the running harness. */
+  async function openSession(): Promise<string> {
+    await harness!.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const { sessionId } = await harness!.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    return sessionId
+  }
+
+  /** Settle one completed turn and wait for its final usage update. */
+  async function settle(sessionId: string, text: string): Promise<void> {
+    await harness!.client.prompt({ sessionId, prompt: [{ type: 'text', text }] })
+    await vi.waitFor(() => { expect(harness!.updates.at(-1)?.sessionUpdate).toBe('usage_update') })
+  }
+
+  it('falls back to the built-in CNY default when the deployment configures none', async () => {
+    delete process.env.DSH_ACP_PRICES
+    harness = await makeBridgeHarness({ script: [textResponse('hi')] })
+    const sessionId = await openSession()
+    await settle(sessionId, 'go')
+
+    // `mock` is absent from the price table, so the cost segment is the placeholder.
+    expect(cardTitle(1)).toMatch(/ · ¥--$/)
+  })
+
+  it('honours an explicitly configured USD default over the built-in CNY one', async () => {
+    process.env.DSH_ACP_PRICES = '{"$defaultCurrency":"USD"}'
+    harness = await makeBridgeHarness({ script: [textResponse('hi')] })
+    const sessionId = await openSession()
+    await settle(sessionId, 'go')
+
+    expect(cardTitle(1)).toMatch(/ · \$--$/)
+  })
+
+  it('prefers the currency the session already priced in over the deployment default', async () => {
+    // `mock` bills in EUR while the deployment default stays CNY, so once the
+    // session has learned EUR, a later unpriced turn must render EUR, not CNY.
+    // JSON has no numeric separators: `1_000_000` here would fail the whole
+    // parse and silently fall back to the built-in table.
+    process.env.DSH_ACP_PRICES = '{"$defaultCurrency":"CNY","mock":{"hit":0,"miss":1000000,"out":0,"currency":"EUR"}}'
+    harness = await makeBridgeHarness({ script: [textResponse('one'), textResponse('two')] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    await settle(created.sessionId, 'first')
+    expect(cardTitle(1)).toMatch(/ · €5\.0000$/)
+
+    const model = created.configOptions?.find(option => option.id === 'model')
+    if (model?.type !== 'select') throw new Error('expected a model select option')
+    const choices = model.options.flatMap(option => 'group' in option ? option.options : [option])
+    const plain = choices.find(option => option.name === 'Mock Plain')
+    if (plain === undefined) throw new Error('expected Mock Plain in the model catalog')
+    await harness.client.setSessionConfigOption({ sessionId: created.sessionId, configId: 'model', value: plain.value })
+    await settle(created.sessionId, 'second')
+
+    expect(cardTitle(2)).toMatch(/ · €--$/)
+  })
+
+  it('drives the placeholder from the plugin config block, not only the env document', async () => {
+    // Covers the `apply()` seam: the schema-validated `prices` block reaching
+    // the price table, which no other test exercised.
+    delete process.env.DSH_ACP_PRICES
+    harness = await makeBridgeHarness({
+      script: [textResponse('hi')],
+      config: { prices: { defaultCurrency: 'EUR', models: [{ id: 'mock', hit: 0, miss: 1, out: 0, currency: 'CNY' }] } },
+    })
+    const sessionId = await openSession()
+    await settle(sessionId, 'go')
+
+    // Priced: `mock` bills in CNY through the config block.
+    expect(cardTitle(1)).toMatch(/ · ¥0\.0000$/)
+  })
+
+  it('uses the config block currency for the placeholder when the model is unlisted', async () => {
+    delete process.env.DSH_ACP_PRICES
+    harness = await makeBridgeHarness({
+      script: [textResponse('one'), textResponse('two')],
+      config: { prices: { defaultCurrency: 'USD', models: [{ id: 'mock', hit: 0, miss: 1000000, out: 0, currency: 'EUR' }] } },
+    })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    await settle(created.sessionId, 'first')
+    expect(cardTitle(1)).toMatch(/ · €5\.0000$/)
+
+    const model = created.configOptions?.find(option => option.id === 'model')
+    if (model?.type !== 'select') throw new Error('expected a model select option')
+    const choices = model.options.flatMap(option => 'group' in option ? option.options : [option])
+    const plain = choices.find(option => option.name === 'Mock Plain')
+    if (plain === undefined) throw new Error('expected Mock Plain in the model catalog')
+    await harness.client.setSessionConfigOption({ sessionId: created.sessionId, configId: 'model', value: plain.value })
+    await settle(created.sessionId, 'second')
+
+    // The session knows EUR, so the unlisted `plain` turn keeps EUR.
+    expect(cardTitle(2)).toMatch(/ · €--$/)
   })
 })

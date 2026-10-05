@@ -17,6 +17,23 @@
 import { assistantStreamFirstTokenTime, type TokenUsage } from '@deepseek-ai/dsh-llm'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 
+/** ISO 4217 shape shared by every currency field in this module. */
+const ISO_CURRENCY = /^[A-Z]{3}$/
+
+/** Billing currency a price entry uses when it names none. CNY matches the
+ * shipped list prices and the placeholder default, so a currency-less override
+ * entered in yuan is no longer mislabeled USD. */
+const ENTRY_DEFAULT_CURRENCY = 'CNY'
+
+/** Currency the price document's `$defaultCurrency` falls back to when it is unset. */
+const DOCUMENT_DEFAULT_CURRENCY = 'CNY'
+
+/** Prefix reserving document-level meta keys so they are never read as model ids. */
+const PRICE_META_PREFIX = '$'
+
+/** Meta key naming the deployment's billing currency for the unpriced placeholder. */
+const DEFAULT_CURRENCY_KEY = `${PRICE_META_PREFIX}defaultCurrency`
+
 /** Per-1M-token prices for one pricing tier. */
 export interface UsagePrice {
   /** 1M input tokens served from cache. */
@@ -53,24 +70,35 @@ export interface PriceTable {
   tiered: ReadonlyMap<string, TieredPriceEntry>
   /** Retired model ids redirected to their serving successor. */
   aliases: ReadonlyMap<string, string>
+  /**
+   * Currency the unpriced placeholder renders when the session has no priced
+   * turn to learn one from. Declared by the deployment as the config
+   * `prices.defaultCurrency` or the document's `$defaultCurrency` meta key, CNY
+   * when it names none. It does not change the entries' own `currency`, which
+   * still defaults to USD.
+   */
+  defaultCurrency: string
 }
 
 /**
- * DeepSeek list prices (USD per 1M tokens), published 2026-09 on
- * api-docs.deepseek.com: peak hours 01:00–04:00 and 06:00–10:00 UTC on
+ * DeepSeek list prices (CNY per 1M tokens), taken from
+ * https://api-docs.deepseek.com/zh-cn/quick_start/pricing/ : peak hours
+ * 09:00–12:00 and 14:00–18:00 Beijing time (01:00–04:00 and 06:00–10:00 UTC) on
  * weekdays, off-peak exactly half. Chinese-public-holiday exclusion is not
- * modeled; override with DSH_ACP_PRICES when that precision matters.
+ * modeled; override with the plugin's `prices` block or DSH_ACP_PRICES when
+ * that precision matters.
  */
 export const DEEPSEEK_PRICE_TABLE: PriceTable = {
   flat: new Map(),
   tiered: new Map([
-    ['deepseek-flash', { peak: { hit: 0.006, miss: 0.3, out: 1.2 }, currency: 'USD' }],
-    ['deepseek-v4-pro', { peak: { hit: 0.044, miss: 1.32, out: 3.96 }, currency: 'USD' }],
+    ['deepseek-flash', { peak: { hit: 0.04, miss: 2, out: 8 }, currency: 'CNY' }],
+    ['deepseek-v4-pro', { peak: { hit: 0.3, miss: 9, out: 27 }, currency: 'CNY' }],
   ]),
   aliases: new Map([
     ['deepseek-v4-flash', 'deepseek-flash'],
     ['deepseek-v4-flash-vision-exp', 'deepseek-flash'],
   ]),
+  defaultCurrency: DOCUMENT_DEFAULT_CURRENCY,
 }
 
 /**
@@ -97,37 +125,142 @@ function normalizeEntry(model: string, value: unknown): FlatPriceEntry {
       throw new Error(`entry "${model}" field "${name}" must be a finite non-negative number`)
     }
   }
-  if (currency !== undefined && (typeof currency !== 'string' || !/^[A-Z]{3}$/.test(currency))) {
+  if (currency !== undefined && (typeof currency !== 'string' || !ISO_CURRENCY.test(currency))) {
     throw new Error(`entry "${model}" currency must be an ISO 4217 code such as "USD"`)
   }
-  return { hit: hit as number, miss: miss as number, out: out as number, currency: currency === undefined ? 'USD' : currency as string }
+  return { hit: hit as number, miss: miss as number, out: out as number, currency: currency === undefined ? ENTRY_DEFAULT_CURRENCY : currency as string }
+}
+
+/** One parsed price document: flat entries plus the deployment's billing currency. */
+export interface PriceDocument {
+  /** Validated flat entries by exact model id. */
+  entries: Map<string, FlatPriceEntry>
+  /** Billing currency for the unpriced placeholder; CNY when the meta key is absent. */
+  defaultCurrency: string
 }
 
 /**
- * Parse the DSH_ACP_PRICES override document: an object mapping model ids to
- * `{ hit, miss, out, currency? }` per-1M flat rates.
+ * Parse the DSH_ACP_PRICES document: an object mapping model ids to
+ * `{ hit, miss, out, currency? }` per-1M flat rates, plus the optional
+ * `$defaultCurrency` meta key naming the deployment's billing currency.
  * @param json - raw environment value.
- * @returns validated flat entries by exact model id.
+ * @returns validated flat entries and the document's default currency.
  * @throws Error describing the first malformed aspect.
  */
-export function parsePriceOverrides(json: string): Map<string, FlatPriceEntry> {
+export function parsePriceDocument(json: string): PriceDocument {
   const parsed: unknown = JSON.parse(json)
   if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
     throw new Error('value must be a JSON object of model entries')
   }
   const entries = new Map<string, FlatPriceEntry>()
+  let defaultCurrency: string | undefined
   for (const [model, value] of Object.entries(parsed as Record<string, unknown>)) {
+    if (model.startsWith(PRICE_META_PREFIX)) {
+      if (model !== DEFAULT_CURRENCY_KEY) throw new Error(`unknown meta key "${model}"`)
+      if (typeof value !== 'string' || !ISO_CURRENCY.test(value)) {
+        throw new Error(`meta key "${model}" must be an ISO 4217 code such as "USD"`)
+      }
+      defaultCurrency = value
+      continue
+    }
     entries.set(model, normalizeEntry(model, value))
   }
-  return entries
+  return { entries, defaultCurrency: defaultCurrency ?? DOCUMENT_DEFAULT_CURRENCY }
+}
+
+/** One model's rates as the plugin config declares them. */
+export interface ConfigPrice {
+  /** Served model id this entry prices, matched exactly and case-sensitively. */
+  id: string
+  /** Per-1M rate for input served from the prefix cache. */
+  hit: number
+  /** Per-1M rate for uncached input and cache writes. */
+  miss: number
+  /** Per-1M rate for output tokens. */
+  out: number
+  /** ISO 4217 code; defaults to CNY, independently of `PriceConfig.defaultCurrency`. */
+  currency?: string
+}
+
+/** The plugin config's `prices` block: per-model rates plus the placeholder currency. */
+export interface PriceConfig {
+  /** Currency the unpriced placeholder renders; CNY when absent. */
+  defaultCurrency?: string
+  /** Rates per served model id, declared as a list to mirror the overlay's
+   * provider-routing rows. */
+  models?: ConfigPrice[]
+}
+
+/** Keys the config `prices` block accepts; anything else is a typo worth failing on. */
+const PRICE_CONFIG_KEYS: ReadonlySet<string> = new Set(['defaultCurrency', 'models'])
+
+/** Keys one config price entry accepts; a misspelled `currency` must not price as USD silently. */
+const CONFIG_PRICE_KEYS: ReadonlySet<string> = new Set(['id', 'hit', 'miss', 'out', 'currency'])
+
+/**
+ * Build a price document from the plugin config's `prices` block. Model ids are
+ * taken verbatim from each entry's `id`, so no reserved meta prefix applies
+ * here: `defaultCurrency` is a sibling of `models`, not a key inside it. Keys
+ * are whitelisted because the schema types a misspelled key as absent rather
+ * than rejecting it, and a silently-ignored `defaultCurrencyy` would leave the
+ * placeholder on its default with no feedback.
+ * @param config - the validated `prices` block, or undefined when unset.
+ * @returns a document ready for {@link mergePriceOverrides}.
+ * @throws Error describing the first malformed aspect, including a duplicated id.
+ */
+export function priceDocumentFromConfig(config: PriceConfig): PriceDocument {
+  for (const key of Object.keys(config)) {
+    if (!PRICE_CONFIG_KEYS.has(key)) throw new Error(`unknown prices key "${key}"`)
+  }
+  const { defaultCurrency, models } = config
+  if (defaultCurrency !== undefined && !ISO_CURRENCY.test(defaultCurrency)) {
+    throw new Error(`config "defaultCurrency" must be an ISO 4217 code such as "USD"`)
+  }
+  const entries = new Map<string, FlatPriceEntry>()
+  for (const value of models ?? []) {
+    if (typeof value !== 'object' || value === null) throw new Error('each price entry must be an object')
+    for (const key of Object.keys(value)) {
+      if (!CONFIG_PRICE_KEYS.has(key)) throw new Error(`entry has an unknown field "${key}"`)
+    }
+    if (typeof value.id !== 'string' || value.id === '') throw new Error('each price entry needs a non-empty "id"')
+    if (entries.has(value.id)) throw new Error(`duplicate price entry for model "${value.id}"`)
+    entries.set(value.id, normalizeEntry(value.id, value))
+  }
+  return { entries, defaultCurrency: defaultCurrency ?? DOCUMENT_DEFAULT_CURRENCY }
 }
 
 /**
- * Overlay flat env entries on a base table; flat entries win over tiered ones
- * for the same resolved id, and extra ids add new coverage.
+ * Resolve the effective price table: the plugin config's `prices` block when it
+ * declares anything, else the legacy `DSH_ACP_PRICES` document. When both are
+ * present the env document is reported as ignored rather than dropped in
+ * silence, so a deployment never has two silently competing price sources.
+ * @param config - the plugin config's `prices` block, if any.
+ * @param env - raw `DSH_ACP_PRICES` value, if set.
+ * @param warn - warning sink for a rejected or shadowed source.
+ * @returns the effective price table.
  */
-export function mergePriceOverrides(base: PriceTable, overrides: ReadonlyMap<string, FlatPriceEntry>): PriceTable {
-  return { ...base, flat: new Map([...base.flat, ...overrides]) }
+export function resolvePriceTable(config: PriceConfig | undefined, env: string | undefined, warn: (message: string) => void): PriceTable {
+  const configured = config !== undefined && (config.defaultCurrency !== undefined || Object.keys(config.models ?? {}).length > 0)
+  if (configured) {
+    if (env !== undefined && env.trim() !== '') {
+      warn('DSH_ACP_PRICES ignored: the plugin config "prices" block takes precedence; '
+        + 'move every DSH_ACP_PRICES rate into prices.models, or drop the prices block to keep the environment document')
+    }
+    return mergePriceOverrides(DEEPSEEK_PRICE_TABLE, priceDocumentFromConfig(config))
+  }
+  return buildPriceTable(env, warn)
+}
+
+/**
+ * Overlay one parsed price document on a base table; flat entries win over
+ * tiered ones for the same resolved id, extra ids add new coverage, and the
+ * document's default currency replaces the base's.
+ * @param base - table to overlay onto.
+ * @param doc - document produced by {@link parsePriceDocument}, whose currency
+ * fields are already validated; a hand-built document is trusted as-is.
+ */
+export function mergePriceOverrides(base: PriceTable, doc: PriceDocument): PriceTable {
+  return { ...base, flat: new Map([...base.flat, ...doc.entries]), defaultCurrency: doc.defaultCurrency }
 }
 
 /**
@@ -172,7 +305,7 @@ export function priceUsage(rates: UsagePrice, usage: TokenUsage): number {
 export function buildPriceTable(env: string | undefined, warn: (message: string) => void): PriceTable {
   if (env === undefined || env.trim() === '') return DEEPSEEK_PRICE_TABLE
   try {
-    return mergePriceOverrides(DEEPSEEK_PRICE_TABLE, parsePriceOverrides(env))
+    return mergePriceOverrides(DEEPSEEK_PRICE_TABLE, parsePriceDocument(env))
   } catch (error: unknown) {
     warn(`DSH_ACP_PRICES ignored: ${(error as Error).message}`)
     return DEEPSEEK_PRICE_TABLE
@@ -471,40 +604,84 @@ export interface StatsTitleFacts {
   outputTokens: number
   /** Priced turn cost, when the model's listing resolved. */
   cost: { amount: number; currency: string } | undefined
+  /**
+   * Currency the unpriced placeholder renders: the session's priced currency,
+   * falling back to the deployment's default. Unused once `cost` is present.
+   */
+  fallbackCurrency: string
+  /**
+   * The deployment default, supplying the symbol for a currency the symbol
+   * table does not know (a JPY-priced entry renders with the CNY default's
+   * `¥`). Unused once `cost`'s own currency has a symbol.
+   */
+  defaultCurrency: string
+}
+
+/**
+ * Symbols a currency renders with, shared by priced amounts and the unpriced
+ * placeholder so one currency never has two shapes. A code without an entry
+ * falls back to the deployment default's symbol instead of a bare code suffix.
+ */
+const CURRENCY_SYMBOLS: ReadonlyMap<string, string> = new Map([
+  ['USD', '$'],
+  ['CNY', '¥'],
+  ['EUR', '€'],
+])
+
+/**
+ * Symbol for one currency: its own when the table knows it, else the
+ * deployment default's, so a code like JPY renders `¥1.5000` rather than
+ * `1.5000 JPY`. `undefined` only when neither side carries a symbol.
+ */
+function currencySymbol(currency: string, defaultCurrency: string): string | undefined {
+  return CURRENCY_SYMBOLS.get(currency) ?? CURRENCY_SYMBOLS.get(defaultCurrency)
+}
+
+/** The unknown-amount placeholder for one currency: `$--`, `¥--`, `€--`. */
+function unpricedPlaceholder(currency: string, defaultCurrency: string): string {
+  const symbol = currencySymbol(currency, defaultCurrency)
+  return symbol === undefined ? `-- ${currency}` : `${symbol}--`
 }
 
 /**
  * The card row title shown while collapsed, naming the serving model when known.
  * With `facts` it also carries the one-line usage summary, because expansion is
- * a client-side decision the protocol cannot force: an unpriced model is named
- * `unpriced` instead of silently dropping the cost segment.
+ * a client-side decision the protocol cannot force: an unpriced model keeps the
+ * cost segment as a currency-styled placeholder instead of dropping it.
  */
 export function statsCardTitle(modelId: string | undefined, facts?: StatsTitleFacts): string {
   const base = modelId === undefined ? 'Turn stats' : `Turn stats · ${modelId}`
   if (facts === undefined) return base
-  const usage = `in ${formatTokenCount(facts.inputTokens)} / out ${formatTokenCount(facts.outputTokens)}`
-  const cost = facts.cost === undefined ? 'unpriced' : formatMoney(facts.cost.amount, facts.cost.currency)
+  const usage = `↑ ${formatTokenCount(facts.inputTokens)} · ↓ ${formatTokenCount(facts.outputTokens)}`
+  const cost = facts.cost === undefined
+    ? unpricedPlaceholder(facts.fallbackCurrency, facts.defaultCurrency)
+    : formatMoney(facts.cost.amount, facts.cost.currency, facts.defaultCurrency)
   return `${base} · ${usage} · ${cost}`
 }
 
-/** Format a currency amount with stable precision. */
-function formatMoney(amount: number, currency: string): string {
-  return currency === 'USD' ? `$${amount.toFixed(4)}` : `${amount.toFixed(4)} ${currency}`
+/** Format a currency amount with stable precision, symboled when one is known. */
+function formatMoney(amount: number, currency: string, defaultCurrency: string): string {
+  const symbol = currencySymbol(currency, defaultCurrency)
+  return symbol === undefined ? `${amount.toFixed(4)} ${currency}` : `${symbol}${amount.toFixed(4)}`
 }
 
 /**
  * Render the end-of-turn statistics as the markdown text of the turn-stats
- * card. Cache rows appear only when the adapter reported them; timing and
- * cost segments appear only when their facts exist.
+ * card: a single two-column table (`metric` / `value`) carrying every fact, so
+ * expanded cards have no stray lines outside it. Rows appear only when their
+ * facts exist — cache rows when the adapter reported them, speed and latency
+ * rows only for steps that recorded both halves, cost rows only when the
+ * listing resolved.
  * @param turn - finalized turn statistics.
  * @param session - session-lifetime totals for the cumulative line.
  * @param modelId - model selection that served the turn, if known.
+ * @param defaultCurrency - deployment default, supplying the symbol for a
+ *   currency the symbol table does not know.
  * @returns the card's markdown text.
  */
-export function formatStatsCard(turn: TurnStats, session: SessionStats, modelId: string | undefined): string {
+export function formatStatsCard(turn: TurnStats, session: SessionStats, modelId: string | undefined, defaultCurrency: string): string {
   const lines: string[] = []
-  lines.push(`**${statsCardTitle(modelId)}** — llm ${formatMs(turn.timing.llmMs)} · tools ${formatMs(turn.timing.toolMs)}`, '')
-  lines.push('| | tokens |', '|---|---:|')
+  lines.push(`**${statsCardTitle(modelId)}**`, '', '| metric | value |', '|---|---:|')
   if (turn.usage.cacheReadTokens !== undefined) {
     lines.push(`| Input · cache read | ${turn.usage.cacheReadTokens.toLocaleString('en-US')} |`)
   }
@@ -513,21 +690,18 @@ export function formatStatsCard(turn: TurnStats, session: SessionStats, modelId:
   }
   lines.push(`| Input · uncached | ${turn.usage.uncachedInputTokens.toLocaleString('en-US')} |`)
   lines.push(`| Output | ${turn.usage.outputTokens.toLocaleString('en-US')} |`)
-  lines.push('')
-  const cache: string[] = []
   const turnHit = cacheHitRate(turn.usage)
-  if (turnHit !== undefined) cache.push(`cache hit ${(turnHit * 100).toFixed(1)}%`)
+  if (turnHit !== undefined) lines.push(`| cache hit | ${(turnHit * 100).toFixed(1)}% |`)
   const sessionHit = cacheHitRate(session.usage)
-  if (sessionHit !== undefined) cache.push(`session cache hit ${(sessionHit * 100).toFixed(1)}%`)
-  if (cache.length > 0) lines.push(cache.join(' · '))
-  const tail: string[] = []
+  if (sessionHit !== undefined) lines.push(`| session cache hit | ${(sessionHit * 100).toFixed(1)}% |`)
+  lines.push(`| model time | ${formatMs(turn.timing.llmMs)} |`)
+  lines.push(`| tool time | ${formatMs(turn.timing.toolMs)} |`)
   const ttft = ttftAvgMs(turn.timing)
-  if (ttft !== undefined) tail.push(`avg first token ${formatMs(ttft)}`)
+  if (ttft !== undefined) lines.push(`| avg first token | ${formatMs(ttft)} |`)
   const tps = outputTps(turn.timing)
-  if (tps !== undefined) tail.push(`decode ${tps.toFixed(1)} tok/s`)
-  if (turn.cost !== undefined) tail.push(`turn ${formatMoney(turn.cost.amount, turn.cost.currency)}`)
-  if (session.cost !== undefined) tail.push(`session ${formatMoney(session.cost.amount, session.cost.currency)}`)
-  if (tail.length > 0) lines.push(tail.join(' · '))
+  if (tps !== undefined) lines.push(`| decode speed | ${tps.toFixed(1)} tok/s |`)
+  if (turn.cost !== undefined) lines.push(`| turn cost | ${formatMoney(turn.cost.amount, turn.cost.currency, defaultCurrency)} |`)
+  if (session.cost !== undefined) lines.push(`| session cost | ${formatMoney(session.cost.amount, session.cost.currency, defaultCurrency)} |`)
   return lines.join('\n')
 }
 
