@@ -3,7 +3,7 @@
 本项目的所有显著变更都会记录在此文件。本格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0)，
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/1.1.0/)；各版本日期为 UTC 发布日。
 
-## [0.3.3] - 2026-10-06
+## [0.3.3] - 2026-10-05
 
 ### 新增
 
