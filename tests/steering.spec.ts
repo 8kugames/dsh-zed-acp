@@ -33,6 +33,9 @@ function userPromptTexts(events: readonly SessionEvent[]): string[] {
   return texts
 }
 
+/** A canonical-base64 1x1 PNG, small enough for the harness image limits. */
+const TINY_PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC'
+
 describe('_session/steering', () => {
   let harness: BridgeHarness | undefined
 
@@ -237,5 +240,43 @@ describe('_session/steering', () => {
 
     await harness.client.cancel({ sessionId: session.sessionId })
     await prompt
+  })
+
+  it('answers promptRequired when the turn is cancelled while image admission is in flight', async () => {
+    // The second steerable() re-check exists for exactly this window: the
+    // turn the message aimed at must stay live through admission, which for
+    // an image awaits attachment storage. Cancelling behind that await must
+    // land on promptRequired, never on a steered message with no owning turn.
+    harness = await makeBridgeHarness({ imageCapable: true, script: ['hang'] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const session = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const prompt = harness.client.prompt({
+      sessionId: session.sessionId,
+      prompt: [{ type: 'text', text: 'original' }],
+    })
+    await waitForRunningTurn()
+
+    // Hold the attachment write open so admission is observably in flight.
+    const store = harness.attachments
+    if (store === undefined) throw new Error('expected the harness attachment store')
+    const originalSave = store.saveImages.bind(store)
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const saveImages = vi.spyOn(store, 'saveImages')
+      .mockImplementation(async inputs => { await gate; return originalSave(inputs) })
+    const steered = harness.client.steer({
+      sessionId: session.sessionId,
+      prompt: [{ type: 'image', data: TINY_PNG, mimeType: 'image/png' }],
+    } as never)
+    await vi.waitFor(() => { expect(saveImages).toHaveBeenCalled() })
+
+    await harness.client.cancel({ sessionId: session.sessionId })
+    release()
+    await expect(steered).resolves.toEqual({ outcome: 'promptRequired', reason: 'noRunningTurn' })
+    saveImages.mockRestore()
+
+    await expect(prompt).resolves.toEqual({ stopReason: 'cancelled' })
+    // The steered image never entered the durable transcript.
+    expect(userPromptTexts(await readSessionLog(harness.ctx, session.sessionId))).toEqual(['original'])
   })
 })

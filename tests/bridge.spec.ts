@@ -509,6 +509,32 @@ describe('automation-only ACP bridge', () => {
     })
   })
 
+  it('surfaces cached titles from the projection cache, including predecessor fallback', async () => {
+    harness = await makeBridgeHarness({ script: [textResponse('one'), textResponse('two')] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const first = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    await harness.client.prompt({ sessionId: first.sessionId, prompt: [{ type: 'text', text: 'one' }] })
+    await harness.client.closeSession({ sessionId: first.sessionId })
+    const second = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    await harness.client.prompt({ sessionId: second.sessionId, prompt: [{ type: 'text', text: 'two' }] })
+    await harness.client.closeSession({ sessionId: second.sessionId })
+
+    // A deployment composing the projection cache serves titles from durable
+    // rows: a direct snapshot for one session, a predecessor checkpoint for
+    // the other (no own snapshot — the ?? hands off to the predecessor read).
+    harness.ctx.provide('sessionProjectionCache', {
+      cachedSnapshot: (header: SessionHeader) =>
+        header.id === first.sessionId ? { values: { title: 'Cached title' } } : undefined,
+      cachedPredecessorTitle: (header: SessionHeader) =>
+        header.id === second.sessionId ? { values: { title: 'Inherited title' } } : undefined,
+    } as never)
+
+    const listed = await harness.client.listSessions({})
+    const byId = new Map(listed.sessions.map(entry => [entry.sessionId, entry]))
+    expect(byId.get(first.sessionId)?.title).toBe('Cached title')
+    expect(byId.get(second.sessionId)?.title).toBe('Inherited title')
+  })
+
   it('paginates resumable sessions with an opaque deterministic cursor', async () => {
     harness = await makeBridgeHarness({
       config: { sessionListPageSize: 1 },
@@ -993,6 +1019,76 @@ describe('automation-only ACP bridge', () => {
 
     expect(harness.adapter.requests[0]?.tools?.map(tool => tool.name)).toContain('mcp__fixture__add')
     await harness.client.closeSession({ sessionId: created.sessionId })
+  }, 30_000)
+
+  /** One scripted model step requesting exactly one tool call by name. */
+  function toolCallResponse(callId: string, name: string, args = '{}'): StreamChunk[] {
+    return [
+      { type: 'block-start', index: 0, blockType: 'tool-call' },
+      { type: 'tool-call-delta', index: 0, id: ToolCallId(callId), name, argumentsDelta: args },
+      { type: 'block-end', index: 0, block: { type: 'tool-call', id: ToolCallId(callId), name, arguments: args } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ]
+  }
+
+  /** The updates completing real tool calls (turn-stats cards excluded), as (status, text) pairs. */
+  function toolSettlements(): { status: string; text: string }[] {
+    const settled: { status: string; text: string }[] = []
+    for (const update of harness!.updates) {
+      if (update.sessionUpdate !== 'tool_call_update') continue
+      if ('toolCallId' in update && String(update.toolCallId).startsWith('dsh-stats-')) continue
+      if (!('status' in update) || update.status === undefined) continue
+      settled.push({ status: String(update.status), text: JSON.stringify('content' in update ? update.content : undefined) })
+    }
+    return settled
+  }
+
+  it('projects an MCP tool error result without failing the turn', async () => {
+    harness = await makeBridgeHarness({ script: [toolCallResponse('c-1', 'mcp__fixture__fail'), textResponse('recovered')] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const fixtureServer = fileURLToPath(new URL('./fixture-server.ts', import.meta.url))
+    const created = await harness.client.newSession({
+      cwd: process.cwd(),
+      mcpServers: [{ name: 'fixture', command: process.execPath, args: [fixtureServer], env: [] }],
+    })
+
+    // The fixture's `fail` tool answers isError with a text block; the turn
+    // itself is ordinary quiescence and the client sees a failed card.
+    await expect(harness.client.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: 'text', text: 'call the failing tool' }],
+    })).resolves.toEqual({ stopReason: 'end_turn' })
+
+    const settlements = toolSettlements()
+    expect(settlements).toEqual([{ status: 'failed', text: expect.stringContaining('Something went wrong') }])
+  }, 30_000)
+
+  it('keeps the session usable after an MCP server process crashes post-reply', async () => {
+    // The crash turn itself consumes two script entries (the tool-call step
+    // plus its follow-up reply); a third serves the post-crash prompt.
+    harness = await makeBridgeHarness({
+      script: [toolCallResponse('c-1', 'mcp__fixture__crash'), textResponse('acknowledged'), textResponse('still alive')],
+    })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const fixtureServer = fileURLToPath(new URL('./fixture-server.ts', import.meta.url))
+    const created = await harness.client.newSession({
+      cwd: process.cwd(),
+      mcpServers: [{ name: 'fixture', command: process.execPath, args: [fixtureServer], env: [] }],
+    })
+
+    // The fixture's `crash` tool replies first and exits its process 25ms
+    // later: the committed result still settles the call as completed…
+    await expect(harness.client.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: 'text', text: 'call the crashing tool' }],
+    })).resolves.toEqual({ stopReason: 'end_turn' })
+    expect(toolSettlements()).toEqual([{ status: 'completed', text: expect.stringContaining('crashing') }])
+
+    // …and the ACP session keeps serving prompts after the child is gone.
+    await expect(harness.client.prompt({
+      sessionId: created.sessionId,
+      prompt: [{ type: 'text', text: 'still there?' }],
+    })).resolves.toEqual({ stopReason: 'end_turn' })
   }, 30_000)
 
   it('mounts a standard Streamable HTTP MCP server with request headers', async () => {
