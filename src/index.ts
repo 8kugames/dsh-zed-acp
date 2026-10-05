@@ -74,6 +74,7 @@ import type {} from '@deepseek-ai/dsh-session-title'
 import type {} from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-user-questions'
 import { authenticate as authenticateCredential, acpAuthMethods, resolveApiKeyRef } from './auth.ts'
+import { WireLineLimiter } from './codec.ts'
 import { AcpContentError, mountsAcpImageAttachments, supportsAcpImagePrompts } from './content.ts'
 import { AcpMcpConfigError } from './mcp.ts'
 import { AcpModelConfigError, createReasoningPreferenceStore, defaultReasoningPreferencePath } from './model-control.ts'
@@ -722,11 +723,23 @@ export function apply(ctx: Context, config: AcpConfig): void {
     },
   }
 
-  /* v8 ignore next 4 -- production stdio wiring; tests inject config.stream. */
-  const stream: Stream = config.stream ?? ndJsonStream(
-    Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
-    Readable.toWeb(process.stdin) as ReadableStream<Uint8Array>,
-  )
+  /* v8 ignore start -- production stdio wiring; tests inject config.stream. */
+  const stream: Stream = config.stream ?? (() => {
+    // Frame the inbound NDJSON with a per-line byte ceiling: the SDK's own
+    // line splitter buffers without bound, so an oversized line must fail the
+    // transport here instead of growing the process heap until it dies.
+    const limiter = new WireLineLimiter()
+    process.stdin.pipe(limiter)
+    limiter.on('error', (error: unknown) => {
+      logger.warn(`acp: dropping the connection after an oversized wire line: ${String(error)}`)
+      process.stdin.destroy()
+    })
+    return ndJsonStream(
+      Writable.toWeb(process.stdout) as WritableStream<Uint8Array>,
+      Readable.toWeb(limiter) as ReadableStream<Uint8Array>,
+    )
+  })()
+  /* v8 ignore stop */
   // The SDK dispatches every incoming message through the handler chain in
   // registration order, so each registered method adds one dispatch hop to
   // every message behind it. Cancellation is the latency-critical direction
