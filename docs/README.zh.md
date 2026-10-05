@@ -1,8 +1,8 @@
 # @8kugames/dsh-zed-acp
 
-[English](README.md) | 中文
+[English](../README.md) | 中文
 
-一个面向 [Agent Client Protocol](https://agentclientprotocol.com/) 的服务器，为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 打包成可自由安装的 dsh 插件。它把 `dsh` 变成 [Zed](https://zed.dev)（或任何 ACP 客户端）可以驱动的外部 agent：流式回答与思考过程、带真实文件差异的工具调用、计划模式、agent 预设、权限预设、会话历史与 MCP 服务器。
+一个面向 Zed 的 [Agent Client Protocol](https://agentclientprotocol.com/) 服务器，为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 打包成可自由安装的 dsh 插件。它把 `dsh` 变成 [Zed](https://zed.dev)（或任何 ACP 客户端）可以驱动的外部 agent：流式回答与思考过程、带真实文件差异的工具调用、计划模式、agent 预设、权限预设、会话历史与 MCP 服务器。
 
 按 dsh `0.2.0-rc.2` 构建并测试。插件组合在已安装的 harness 之上运行——它不自带运行时，也绝不把你的 key 写进编辑器配置。
 
@@ -10,15 +10,21 @@
 
 前置条件：[dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) 钉到插件对应的版本（`npm i -g @deepseek-ai/dsh@0.2.0-rc.2`——npm 的 `latest` 标签可能落后）、Node `^22.19 || >=24`，以及 Zed。
 
-在首个 npm 发布之前，直接从本仓库安装（ref 指向携带插件的分支；合并进 `master` 后改为 `master`）：
+从 npm registry 安装：
+
+```sh
+dsh plugin --profile zed add @8kugames/dsh-zed-acp
+```
+
+重新执行同一条 `add` 命令即可更新已安装的插件——仅重启 profile 不会带来旧版本未携带的文件（`presets/` 下的预设声明就是这类新增）。
+
+若要跟踪某个分支而非正式发布（例如某项改动尚未发布时），从仓库 ref 安装：
 
 ```sh
 dsh plugin --profile zed add "github:8kugames/dsh-zed-acp#zed-acp"
 ```
 
-重新执行同一条 `add` 命令即可更新已安装的插件——仅重启 profile 不会带来旧版本未携带的文件（`presets/` 下的预设声明就是这类新增）。
-
-`@8kugames/dsh-zed-acp` 发布之后，同一个包从 registry 安装。分功能的完整指引（模式、预设、权限、会话、排障）见 [docs/zed-acp.zh.md](docs/zed-acp.zh.md)。
+分功能的完整指引（模式、预设、权限、会话、排障）见 [zed-acp.zh.md](./zed-acp.zh.md)。
 
 ### 从本地 clone 安装
 
@@ -58,7 +64,7 @@ dsh plugin --profile zed add -w "link:/absolute/path/to/dsh-zed-acp"
 | 认证       | 接受但不校验                        | `deepseek-api-key` 方法；`authenticate` 校验凭据并解释缺什么                                                                                                                                                                                                                                                                                      |
 | 模式       | ——                                  | 经 `session/set_mode` 的 `default` / `plan`，附 `current_mode_update`                                                                                                                                                                                                                                                                             |
 | 配置项     | `model`、`reasoning_effort`         | 另有 **`preset`**（agent 预设）与 **`permission`**（沙箱/审批预设，本地化文案）                                                                                                                                                                                                                                                                   |
-| 问题       | ——                                  | 单选 `ask_user_question`（计划评审）经 `session/request_permission` 往返                                                                                                                                                                                                                                                                          |
+| 问题       | ——                                  | 单选 `ask_user_question`（计划评审）经 `session/request_permission` 往返；客户端声明 form elicitation 时菜单末尾合成 **Other** 兜底项，经 `elicitation/create` 收集自由文本，无选项问题直接成为自由文本表单                                                                                                                                       |
 | 计划       | ——                                  | agent 的 `todo` 快照投射为 ACP `plan` 更新，客户端用原生计划面板渲染                                                                                                                                                                                                                                                                              |
 | 斜杠命令   | ——                                  | `available_commands_update` 按会话列出宿主命令注册表的有效目录                                                                                                                                                                                                                                                                                    |
 | 工具调用   | 通用 `other` 类别                   | 标准类别（`edit`/`read`/`search`/`execute`/`fetch`/`switch_mode`）、跟随式 **`locations`**，与 `write`/`edit` 结果的原生**文件差异**                                                                                                                                                                                                              |
@@ -138,7 +144,7 @@ npm run build       # esbuild → dist/
 dsh plugin --profile zed-dev add -w "link:$PWD"   # 在仓库根目录执行
 ```
 
-开发循环是 `npm run build` + 重启 Zed agent。
+开发循环是 `npm run build` + 重启 Zed agent。若要手工通过 stdio JSON-RPC 探测运行中的桥，`scripts/acp-probe.mjs` 是一个最小手动探针（无参数；不属于测试套件）。
 
 ## 发布
 
@@ -148,4 +154,4 @@ dsh plugin --profile zed-dev add -w "link:$PWD"   # 在仓库根目录执行
 
 ## 许可
 
-MIT。本包衍生自 `deepseek-harness`（MIT，Copyright (c) 2026 DeepSeek）；归属详情见 [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md)。
+MIT。本包衍生自 `deepseek-harness`（MIT，Copyright (c) 2026 DeepSeek）；归属详情见 [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md)。

@@ -1,6 +1,6 @@
 # @8kugames/dsh-zed-acp
 
-English | [中文](README.zh.md)
+English | [中文](docs/README.zh.md)
 
 A Zed-oriented [Agent Client Protocol](https://agentclientprotocol.com/) server for
 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness), packaged as a
@@ -17,15 +17,21 @@ editor config.
 
 Prerequisites: [dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) pinned to the version the plugin targets (`npm i -g @deepseek-ai/dsh@0.2.0-rc.2` — the npm `latest` tag may trail it), Node `^22.19 || >=24`, and Zed.
 
-Until the first npm release ships, install from this repository (the ref names the branch carrying the plugin; point it at `master` once merged):
+Install from the npm registry:
+
+```sh
+dsh plugin --profile zed add @8kugames/dsh-zed-acp
+```
+
+Re-run the same `add` command to update an existing install — a profile restart alone does not pick up files the previously installed version did not ship (the preset declarations under `presets/` are one such addition).
+
+To track a branch instead of a release (for example while a change awaits publication), install from the repository ref:
 
 ```sh
 dsh plugin --profile zed add "github:8kugames/dsh-zed-acp#zed-acp"
 ```
 
-Re-run the same `add` command to update an existing install — a profile restart alone does not pick up files the previously installed version did not ship (the preset declarations under `presets/` are one such addition).
-
-Once `@8kugames/dsh-zed-acp` is published, the same package installs from the registry. The per-feature walkthrough (modes, presets, permissions, sessions, troubleshooting) lives in [docs/zed-acp.md](docs/zed-acp.md).
+The per-feature walkthrough (modes, presets, permissions, sessions, troubleshooting) lives in [docs/zed-acp.md](docs/zed-acp.md).
 
 ### Install from a local clone
 
@@ -131,7 +137,7 @@ Override or extend pricing with `DSH_ACP_PRICES`, a JSON object of flat per-1M r
 { "my-model": { "hit": 0.01, "miss": 0.2, "out": 0.5, "currency": "CNY" } }
 ```
 
-Malformed values are ignored with a logged warning. Cache writes bill at the miss rate, matching DeepSeek's billing. Cumulative totals cover live turns since the agent process opened the session — resuming a session or restarting Zed starts a fresh tally. Cancelled and failed turns settle without the final update.
+Malformed values are ignored with a logged warning. Cumulative totals cover live turns since the agent process opened the session — resuming a session or restarting Zed starts a fresh tally. Cancelled and failed turns settle without the final update.
 
 ## Compatibility
 
@@ -185,7 +191,7 @@ caches same-version tarballs; `link:` avoids both):
 dsh plugin --profile zed-dev add -w "link:$PWD"   # from the repository root
 ```
 
-The dev loop is `npm run build` + restart the Zed agent.
+The dev loop is `npm run build` + restart the Zed agent. For poking a live bridge by hand over stdio JSON-RPC, `scripts/acp-probe.mjs` is a minimal manual probe (no arguments; not part of the test suite).
 
 ## Release
 
