@@ -31,6 +31,7 @@ function admissionFixture(options: {
   llm?: boolean
   provider?: string | undefined
   model?: string | undefined
+  imageLimits?: { maxImageBytes: number; maxMessageImageBytes: number }
 } = {}): AdmissionFixture {
   const saveImages = vi.fn(async (inputs: readonly SaveImageAttachment[]) => inputs.map((input, index) => ({
     ...REF,
@@ -44,7 +45,15 @@ function admissionFixture(options: {
     name: model,
     inputModalities: ['text', 'image'] as const,
   }))
-  const attachments = options.attachments === false ? undefined : { saveImages }
+  const imageLimits = {
+    maxImageBytes: options.imageLimits?.maxImageBytes ?? 10 * 1024 * 1024,
+    maxImagesPerMessage: 4,
+    maxMessageImageBytes: options.imageLimits?.maxMessageImageBytes ?? 20 * 1024 * 1024,
+    maxImagePixels: 1024,
+    maxImageDimension: 2000,
+    mediaTypes: ['image/png', 'image/jpeg', 'image/webp', 'image/gif'] as const,
+  }
+  const attachments = options.attachments === false ? undefined : { saveImages, imageLimits }
   const llm = options.llm === false ? undefined : { resolveModelInfo }
   const ctx = {
     get(name: string) {
@@ -132,6 +141,37 @@ describe('ACP rich content codec', () => {
       { type: 'resource', resource: { uri: 'file:///tmp/a', text: 'a' } },
     ], true, signal)).rejects.toThrow(/embedded resource/)
     expect(fixture.saveImages).not.toHaveBeenCalled()
+  })
+
+  it('rejects an oversized image on the base64 length before decoding or persisting', async () => {
+    // 1,400 canonical base64 chars decode to exactly 1,050 bytes; a 1,024-byte
+    // per-image cap must refuse the prompt without ever calling the store,
+    // which is the whole point of the pre-decode gate.
+    const fixture = admissionFixture({ imageLimits: { maxImageBytes: 1_024, maxMessageImageBytes: 4_096 } })
+    await expect(admitAcpPrompt(fixture.ctx, fixture.route, [
+      { type: 'image', data: 'A'.repeat(1_400), mimeType: 'image/png' },
+    ], true, new AbortController().signal)).rejects.toThrow(/per-image byte limit/)
+    expect(fixture.saveImages).not.toHaveBeenCalled()
+  })
+
+  it('rejects an image batch whose aggregate estimate crosses the message limit', async () => {
+    // Two images of 600 decoded bytes each are individually fine under the
+    // per-image cap but together cross a 1,024-byte aggregate limit.
+    const fixture = admissionFixture({ imageLimits: { maxImageBytes: 1_024, maxMessageImageBytes: 1_024 } })
+    await expect(admitAcpPrompt(fixture.ctx, fixture.route, [
+      { type: 'image', data: 'A'.repeat(800), mimeType: 'image/png' },
+      { type: 'image', data: 'A'.repeat(800), mimeType: 'image/png' },
+    ], true, new AbortController().signal)).rejects.toThrow(/aggregate image-byte limit/)
+    expect(fixture.saveImages).not.toHaveBeenCalled()
+  })
+
+  it('admits an image exactly at the configured per-image ceiling', async () => {
+    const fixture = admissionFixture({ imageLimits: { maxImageBytes: 3, maxMessageImageBytes: 3 } })
+    // 'AQID' decodes to exactly 3 bytes.
+    await expect(admitAcpPrompt(fixture.ctx, fixture.route, [
+      { type: 'image', data: 'AQID', mimeType: 'image/png' },
+    ], true, new AbortController().signal)).resolves.toHaveLength(1)
+    expect(fixture.saveImages).toHaveBeenCalledTimes(1)
   })
 
   it('requires the advertised capability, store, and exact image-capable route', async () => {

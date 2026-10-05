@@ -59,6 +59,17 @@ function decodeImage(block: Extract<AcpContentBlock, { type: 'image' }>): SaveIm
   return { data, mediaType }
 }
 
+/**
+ * Exact decoded byte count of one canonical base64 string: no whitespace,
+ * standard alphabet and padding, so the length arithmetic is lossless. Used
+ * to reject oversized images *before* the decode/re-encode round trip would
+ * hold several multiples of the payload in memory.
+ */
+function decodedBase64Bytes(value: string): number {
+  const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0
+  return Math.floor((value.length - padding) * 3 / 4)
+}
+
 /** Resolve the exact current route and require explicit image input support. */
 async function assertImageRoute(ctx: Context, route: ModelSelection | undefined, signal: AbortSignal): Promise<void> {
   const provider = route?.provider
@@ -141,15 +152,32 @@ export async function admitAcpPrompt(
   signal: AbortSignal,
 ): Promise<ContentBlock[]> {
   const images: SaveImageAttachment[] = []
+  const attachments = ctx.get('attachments')
+  let imageBytes = 0
   for (const block of prompt) {
     switch (block.type) {
       case 'text':
       case 'resource_link':
         break
-      case 'image':
+      case 'image': {
         if (!imageEnabled) throw new AcpContentError('inline image prompts were not advertised by this connection', 'invalid')
+        if (attachments !== undefined) {
+          // Pre-decode size gate mirroring the store's own limits: rejecting
+          // on the base64 length costs nothing, while decoding first would
+          // hold several copies of an oversized payload before the store's
+          // own validation refused it.
+          const bytes = decodedBase64Bytes(block.data)
+          if (bytes > attachments.imageLimits.maxImageBytes) {
+            throw new AcpContentError('one prompt image exceeds the configured per-image byte limit', 'invalid')
+          }
+          imageBytes += bytes
+          if (imageBytes > attachments.imageLimits.maxMessageImageBytes) {
+            throw new AcpContentError('the prompt image batch exceeds the configured aggregate image-byte limit', 'invalid')
+          }
+        }
         images.push(decodeImage(block))
         break
+      }
       case 'audio':
         throw new AcpContentError('audio prompt content is not supported', 'invalid')
       case 'resource':
@@ -162,7 +190,6 @@ export async function admitAcpPrompt(
 
   let refs: readonly ImageAttachmentRef[] = []
   if (images.length > 0) {
-    const attachments = ctx.get('attachments')
     if (attachments === undefined) throw new AcpContentError('no attachment store is mounted', 'invalid')
     await assertImageRoute(ctx, route, signal)
     signal.throwIfAborted()
