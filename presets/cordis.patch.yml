@@ -15,7 +15,11 @@
           - id: persona
             name: "@deepseek-ai/dsh-persona"
             config:
-              suffix: Your working directory is {{cwd}}.
+              suffix: >-
+                Your working directory is {{cwd}}. Background work you delegate
+                keeps running after your turn ends; the bridge wakes you with a
+                continuation turn once it settles, so end your turn instead of
+                waiting for it with a blocking shell command such as `sleep`.
               prefix: >-
                 You are a coding agent powered by the {{model}} model.
           - id: agent-instructions

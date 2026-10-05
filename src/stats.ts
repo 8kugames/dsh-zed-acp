@@ -520,16 +520,54 @@ export class TurnStatsCollector {
  * @param turn - the finalized turn's statistics.
  * @returns the next session totals snapshot.
  */
-export function foldTurnStats(session: SessionStats, turn: TurnStats): SessionStats {
-  const read = (session.usage.cacheReadTokens ?? 0) + (turn.usage.cacheReadTokens ?? 0)
-  const write = (session.usage.cacheWriteTokens ?? 0) + (turn.usage.cacheWriteTokens ?? 0)
-  const usage: UsageTotals = {
-    uncachedInputTokens: session.usage.uncachedInputTokens + turn.usage.uncachedInputTokens,
-    outputTokens: session.usage.outputTokens + turn.usage.outputTokens,
+/**
+ * Sum two scopes' token accounting. A cache bucket stays absent when neither
+ * side reported one, so an adapter that never reports cache reads cannot make a
+ * later aggregate look as if it had.
+ * @param left - running totals.
+ * @param right - totals to add.
+ * @returns the summed totals.
+ */
+function mergeUsageTotals(left: UsageTotals, right: UsageTotals): UsageTotals {
+  const read = (left.cacheReadTokens ?? 0) + (right.cacheReadTokens ?? 0)
+  const write = (left.cacheWriteTokens ?? 0) + (right.cacheWriteTokens ?? 0)
+  return {
+    uncachedInputTokens: left.uncachedInputTokens + right.uncachedInputTokens,
+    outputTokens: left.outputTokens + right.outputTokens,
     cacheReadTokens: read === 0 ? undefined : read,
     cacheWriteTokens: write === 0 ? undefined : write,
-    modelCalls: session.usage.modelCalls + turn.usage.modelCalls,
+    modelCalls: left.modelCalls + right.modelCalls,
   }
+}
+
+/**
+ * Aggregate two turns of the same ACP prompt into one turn-shaped total, so a
+ * prompt that spans several turns — a continuation issued after background
+ * descendants settle — reports the whole request instead of only its last turn.
+ *
+ * The cost rule is deliberately stricter than {@link foldTurnStats}: a session
+ * keeps its cumulative figure when one turn is unpriced, because the spend that
+ * did happen is still known, but a request whose own turns are not all priced in
+ * one currency has no single honest total, so it reports `undefined` and the
+ * client renders its unpriced placeholder.
+ * @param left - the aggregate so far.
+ * @param right - the turn being folded in.
+ * @returns the aggregate, carrying `right`'s turn number as the prompt's latest.
+ */
+export function mergeTurnStats(left: TurnStats, right: TurnStats): TurnStats {
+  const cost = left.cost === undefined || right.cost === undefined || left.cost.currency !== right.cost.currency
+    ? undefined
+    : { amount: round6(left.cost.amount + right.cost.amount), currency: right.cost.currency }
+  return {
+    turn: right.turn,
+    usage: mergeUsageTotals(left.usage, right.usage),
+    timing: mergeTiming(left.timing, right.timing),
+    cost,
+  }
+}
+
+export function foldTurnStats(session: SessionStats, turn: TurnStats): SessionStats {
+  const usage = mergeUsageTotals(session.usage, turn.usage)
   // A session that already folded a mixed-currency turn stays unpriced even
   // when later turns agree on one currency again: the session did spend in
   // both, and any single cumulative figure would misreport one of them.

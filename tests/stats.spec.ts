@@ -16,6 +16,7 @@ import {
   formatTokenCount,
   isPeakUtcTime,
   mergePriceOverrides,
+  mergeTurnStats,
   parsePriceDocument,
   priceDocumentFromConfig,
   priceUsage,
@@ -314,6 +315,40 @@ describe('mixed-currency cost accounting', () => {
     const plain = foldTurnStats(emptySessionStats(), unpricedTurn)
     expect(plain.cost).toBeUndefined()
     expect(plain.currencyMixed).toBeUndefined()
+  })
+
+  it('aggregates one prompt\'s turns and reports no total once their currencies differ', () => {
+    const zeroTiming = { llmMs: 0, toolMs: 0, decodeMs: 0, decodeTokens: 0, ttftSumMs: 0, ttftCalls: 0 }
+    const first: TurnStats = {
+      turn: 1,
+      usage: { uncachedInputTokens: 100, outputTokens: 10, cacheReadTokens: 40, modelCalls: 1 },
+      timing: { ...zeroTiming, llmMs: 30, ttftSumMs: 30, ttftCalls: 1 },
+      cost: { amount: 0.001, currency: 'USD' },
+    }
+    const second: TurnStats = {
+      turn: 2,
+      usage: { uncachedInputTokens: 200, outputTokens: 20, cacheReadTokens: 60, modelCalls: 1 },
+      timing: { ...zeroTiming, llmMs: 50, ttftSumMs: 50, ttftCalls: 1 },
+      cost: { amount: 0.002, currency: 'USD' },
+    }
+
+    const merged = mergeTurnStats(first, second)
+    // The prompt reports the whole request, numbered by its latest turn.
+    expect(merged.turn).toBe(2)
+    expect(merged.usage).toEqual({
+      uncachedInputTokens: 300,
+      outputTokens: 30,
+      cacheReadTokens: 100,
+      modelCalls: 2,
+    })
+    expect(merged.timing).toMatchObject({ llmMs: 80, ttftCalls: 2 })
+    expect(merged.cost).toEqual({ amount: 0.003, currency: 'USD' })
+
+    // A request whose own turns are not all priced in one currency has no single
+    // honest total — unlike a session, which keeps what it already spent.
+    const eurSecond: TurnStats = { ...second, cost: { amount: 0.002, currency: 'EUR' } }
+    expect(mergeTurnStats(first, eurSecond).cost).toBeUndefined()
+    expect(mergeTurnStats(first, { ...second, cost: undefined }).cost).toBeUndefined()
   })
 })
 

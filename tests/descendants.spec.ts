@@ -6,6 +6,7 @@ import { SESSION_FORMAT_VERSION, SessionId, SessionSeq, type SessionEvent, type 
 import { makeBridgeHarness, textResponse, type BridgeHarness } from './harness.ts'
 
 import { DESCENDANT_ACTIVITY_TITLE } from '../src/updates.ts'
+import { DESCENDANT_WAKE_LIMIT } from '../src/session.ts'
 
 type DescendantCardUpdate =
   | Extract<SessionUpdate, { sessionUpdate: 'tool_call' }>
@@ -50,6 +51,18 @@ function descendantCards(harness: BridgeHarness, sessionId: string, stage: 'tool
     }
   }
   return cards
+}
+
+/** Concatenated assistant text the client received for one ACP session. */
+function assistantText(harness: BridgeHarness, sessionId: string): string {
+  let text = ''
+  for (const { sessionId: sid, update } of harness.sessionUpdates) {
+    if (sid !== sessionId) continue
+    if (update.sessionUpdate !== 'agent_message_chunk') continue
+    const content = update.content
+    if (content.type === 'text') text += content.text
+  }
+  return text
 }
 
 describe('descendant history reload projection', () => {
@@ -316,7 +329,7 @@ describe('descendant progress cards', () => {
   })
 
   it('reconciles a stale running state against the mirrored agent status', async () => {
-    harness = await makeBridgeHarness({ script: [textResponse('parent done')] })
+    harness = await makeBridgeHarness({ script: [textResponse('parent done'), textResponse('after descendants')] })
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
     const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
     let settled = false
@@ -342,7 +355,7 @@ describe('descendant progress cards', () => {
   })
 
   it('reconciles from the periodic timer when no descendant input arrives', async () => {
-    harness = await makeBridgeHarness({ script: [textResponse('parent done')] })
+    harness = await makeBridgeHarness({ script: [textResponse('parent done'), textResponse('after descendants')] })
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
     const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
     // Fake only the reconciliation interval: the parent turn's streaming and
@@ -377,7 +390,7 @@ describe('continuable-descendant visibility', () => {
   })
 
   it('holds the prompt until a continuable descendant goes idle and projects its activity card', async () => {
-    harness = await makeBridgeHarness({ script: [textResponse('parent done')] })
+    harness = await makeBridgeHarness({ script: [textResponse('parent done'), textResponse('after descendants')] })
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
     const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
     let settled = false
@@ -403,6 +416,18 @@ describe('continuable-descendant visibility', () => {
     expect(settledCards).toHaveLength(1)
     expect(settledCards[0]!.toolCallId).toBe(opened[0]!.toolCallId)
     expect(settledCards[0]!.status).toBe('completed')
+    // The turn ended while the descendant still worked, so the bridge woke the
+    // agent with a continuation under the same open prompt instead of settling
+    // it: the client receives the continuation turn's answer.
+    expect(assistantText(harness, sessionId)).toContain('after descendants')
+    expect(harness.adapter.requests).toHaveLength(2)
+    // The one stats card this prompt emits carries both of its turns, not just
+    // the continuation's: the mock bills 5 in / 11 out for `parent done` and
+    // 5 in / 17 out for `after descendants`, and the card is numbered by the
+    // latest turn.
+    const statsCard = harness.updates.find(update => update.sessionUpdate === 'tool_call'
+      && 'toolCallId' in update && update.toolCallId === 'dsh-stats-2')
+    expect(statsCard !== undefined && 'title' in statsCard ? statsCard.title : '').toMatch(/↑ 10 · ↓ 28/)
   })
 
   it('settles promptly on cancel while the descendant keeps running', async () => {
@@ -449,7 +474,7 @@ describe('continuable-descendant visibility', () => {
   })
 
   it('tracks grandchildren through lineage transitively', async () => {
-    harness = await makeBridgeHarness({ script: [textResponse('done')] })
+    harness = await makeBridgeHarness({ script: [textResponse('done'), textResponse('after descendants')] })
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
     const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
     let settled = false
@@ -471,5 +496,54 @@ describe('continuable-descendant visibility', () => {
     const result = await prompt
     expect(result.stopReason).toBe('end_turn')
     expect(descendantCards(harness, sessionId, 'tool_call_update')).toHaveLength(2)
+  })
+
+  it('settles without a continuation when the descendant already settled at turn end', async () => {
+    // A single scripted response makes an unwanted wake observable: the mock
+    // adapter throws once its script is exhausted, so a spurious continuation
+    // fails this test instead of passing silently.
+    harness = await makeBridgeHarness({ script: [textResponse('parent done')] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const prompt = harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] })
+    const child = fakeDescendant(sessionId)
+    await harness.ctx.emit('agent/created', { agent: child, source: 'startup' })
+    await harness.ctx.emit('agent/status', { agent: child, status: 'idle' })
+    const result = await prompt
+    expect(result.stopReason).toBe('end_turn')
+    expect(harness.adapter.requests).toHaveLength(1)
+    expect(assistantText(harness, sessionId)).toBe('parent done')
+  })
+
+  it('stops waking once the continuation limit is spent and settles the prompt', async () => {
+    const turns = DESCENDANT_WAKE_LIMIT + 1
+    harness = await makeBridgeHarness({
+      // Each turn is held open briefly so the test can mark the descendant active
+      // while that turn is genuinely live — the exact wake-up condition.
+      script: Array.from(
+        { length: turns + 1 },
+        (_, index) => ({ chunks: textResponse(`turn ${index}`), holdMs: 120 }),
+      ),
+    })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const prompt = harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] })
+    const child = fakeDescendant(sessionId)
+    await harness.ctx.emit('agent/created', { agent: child, source: 'startup' })
+    for (let turn = 1; turn <= turns; turn += 1) {
+      await vi.waitFor(() => { expect(harness!.adapter.requests.length).toBe(turn) }, { interval: 5, timeout: 4000 })
+      await harness.ctx.emit('agent/status', { agent: child, status: 'running' })
+      await vi.waitFor(
+        () => { expect(assistantText(harness!, sessionId)).toContain(`turn ${turn - 1}`) },
+        { interval: 5, timeout: 4000 },
+      )
+      await new Promise(resolve => setImmediate(resolve))
+      await harness.ctx.emit('agent/status', { agent: child, status: 'idle' })
+    }
+    const result = await prompt
+    expect(result.stopReason).toBe('end_turn')
+    // The bound is what keeps a delegation chain from holding the prompt open
+    // forever, so the prompt must settle on the last turn the budget allows.
+    expect(harness.adapter.requests).toHaveLength(turns)
   })
 })

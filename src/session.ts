@@ -45,6 +45,7 @@ import {
   emptySessionStats,
   foldTurnStats,
   formatStatsCard,
+  mergeTurnStats,
   statsCardTitle,
   sumPromptTokens,
   type PriceTable,
@@ -81,6 +82,37 @@ import {
   type TerminalPresentation,
 } from './updates.ts'
 
+/**
+ * Bound on bridge-issued continuation turns for one ACP prompt. A turn that
+ * ends while background descendants still work is woken again so the delegating
+ * agent can read their results without holding its own turn open (see
+ * {@link AcpSession.settleAfterQuiescence}). The bound stops a delegation chain
+ * that spawns fresh descendants on every wake from holding the client's
+ * `session/prompt` open forever — the same wedge the descendant gate's
+ * reconciliation exists to prevent, one level up.
+ */
+export const DESCENDANT_WAKE_LIMIT = 8
+
+/**
+ * Model-facing text of one continuation turn. It states only what the bridge
+ * observed — that the delegated background work settled — and leaves the next
+ * move to the agent. The leading tag marks it as harness-produced rather than
+ * human input, matching the dedicated source kind below.
+ */
+export const DESCENDANT_WAKE_TEXT =
+  '[harness] Every background subagent you delegated has settled. Read their results and continue; if nothing is left to do, give your final answer.'
+
+/**
+ * This bridge's own user-message source kind, declared in its own module per the
+ * merge-extensible `MessageSourceMap` contract. A continuation turn must not
+ * carry `{ kind: 'user' }`: the reload replay treats that kind as the human
+ * transcript, which would resurrect a harness-authored turn as user input.
+ */
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'acp-descendant-continuation': { kind: 'acp-descendant-continuation' }
+  }
+}
 
 /** Inputs shared by fresh and resumed ACP session construction. */
 interface AcpSessionBuildOptions {
@@ -165,6 +197,8 @@ interface InflightPrompt {
   outputError: Error | undefined
   agentError: Error | undefined
   stats: TurnStats | undefined
+  /** Bridge-issued continuation turns already spent by this prompt. */
+  continuations: number
 }
 
 /** Open one descendant's tracking facts at birth or adoption. */
@@ -622,6 +656,7 @@ export class AcpSession {
       outputError: undefined,
       agentError: undefined,
       stats: undefined,
+      continuations: 0,
     }
     this.inflight = inflight
     const onRequestAbort = (): void => { this.cancelPrompt('ACP prompt request cancelled') }
@@ -1139,7 +1174,11 @@ export class AcpSession {
       this.statsCollector = undefined
       const stats = collector.result()
       if (stats === undefined) return
-      inflight.stats = stats
+      // A prompt can span several turns (a continuation issued after background
+      // descendants settle), so the one card this prompt finally emits must
+      // carry the whole request: fold each turn into the prompt's aggregate
+      // while the session keeps its own per-turn fold.
+      inflight.stats = inflight.stats === undefined ? stats : mergeTurnStats(inflight.stats, stats)
       this.sessionStats = foldTurnStats(this.sessionStats, stats)
       return
     }
@@ -1275,6 +1314,31 @@ export class AcpSession {
     const waiters = this.descendantWaiters
     this.descendantWaiters = []
     for (const resolve of waiters) resolve()
+  }
+
+  /**
+   * Re-enter the agent once the background descendants it delegated have
+   * settled, under the prompt that is still open.
+   *
+   * A turn that ends while descendants still work leaves the agent idle with no
+   * way back in: the gate keeps the *client* waiting, but nothing re-enters the
+   * agent, so an agent that needs its delegation results has no choice but to
+   * hold its own turn open with a blocking shell call. This wake-up removes that
+   * need. `endReason` is cleared because the final stop reason must come from the
+   * last turn, and `messageId` is replaced so the newly claimed turn correlates
+   * back to this same prompt — which is exactly what makes the prompt the owner
+   * of the continuation's stop reason, cost, and output stream.
+   * @param inflight - the settling prompt that owns the continuation.
+   */
+  private wakeForSettledDescendants(inflight: InflightPrompt): void {
+    const message = createUserMessage({
+      content: [{ type: 'text', text: DESCENDANT_WAKE_TEXT }],
+      source: { kind: 'acp-descendant-continuation' },
+    })
+    inflight.endReason = undefined
+    inflight.messageId = message.id
+    inflight.continuations += 1
+    this.agent.followup(message)
   }
 
   /**
@@ -1446,14 +1510,29 @@ export class AcpSession {
     void (async () => {
       await inflight.admissionDone
       if (inflight.messageQueued) {
-        await this.agent.whenIdle()
         // Hold the turn while continuable descendants still work: the prompt
         // answers only after every spawned activity period goes idle, so the
         // client cannot mistake background work for a finished turn. Cancellation
         // skips the wait (agreed semantics: stop settles promptly, the open
         // activity cards keep the remainder visible).
-        while (!inflight.cancelRequested && this.activeDescendantCount() > 0) {
-          await this.whenDescendantsSettled()
+        //
+        // A turn that ends while descendants are still working is precisely the
+        // window an agent otherwise covers by holding its own turn open with a
+        // blocking shell call: the gate keeps the client waiting, but nothing
+        // re-enters the agent, so its delegation results would be lost. Waking it
+        // here — under the prompt that is already open, which therefore owns the
+        // continuation's stop reason, cost, and output stream — removes that
+        // need. The loop repeats only while each new turn again ends with
+        // descendants running, and stops at DESCENDANT_WAKE_LIMIT.
+        for (;;) {
+          await this.agent.whenIdle()
+          const held = !inflight.cancelRequested && this.activeDescendantCount() > 0
+          while (!inflight.cancelRequested && this.activeDescendantCount() > 0) {
+            await this.whenDescendantsSettled()
+          }
+          if (inflight.cancelRequested || !held) break
+          if (inflight.continuations >= DESCENDANT_WAKE_LIMIT) break
+          this.wakeForSettledDescendants(inflight)
         }
         await this.outputTail
       }

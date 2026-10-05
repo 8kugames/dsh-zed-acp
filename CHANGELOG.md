@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+### 新增
+
+- 后台子代理结算唤醒路径：回合在后代仍在运行时结束的，bridge 会在其后代全部空闲后为同一张仍打开的 `session/prompt` 追加一个**续跑回合**（复用 agent 句柄已有的 `followup()`），委派了工作的 agent 因此能读到后代结果并给出最终答复，不必再用阻塞式 shell 调用（例如 `sleep`）把自己的回合按住。此前 `steering.ts` 记录的那个「没有所有者」缺口在这里由已经打开的 prompt 本身补齐：续跑的 stop reason、计费与输出流仍归该 prompt，最终取值来自最后一个回合。续跑消息携带本仓自有的 `MessageSourceMap` 来源 `acp-descendant-continuation` 而非 `user`，因此 `session/load` 的历史回放不会把 harness 发起的续跑当成人类输入，实时投影也不把它当人类消息渲染。每个 prompt 的续跑次数以 `DESCENDANT_WAKE_LIMIT` 为界，避免一条不断派生新后代的委派链把客户端请求无限按住；取消路径不触发续跑。配套把这条契约写进四个内置预设的 persona 段（standard/ptc/cordis 加在 suffix，minimal 因 `complete: true` 只有 prefix 而加在 prefix），明确告知模型「委派的后台工作会在结算后以续跑回合唤醒你，直接结束回合即可」，让模型不再用阻塞式 shell 调用（如 `sleep`）把自己的回合按住等结果。**影响**：一个回合在后代仍在运行时结束的委派会话，现在会多出一个由 bridge 发起的续跑回合。
+
 ## [0.3.2] - 2026-10-05
 
 ### 新增

@@ -13,7 +13,12 @@
           - id: persona
             name: "@deepseek-ai/dsh-persona"
             config:
-              prefix: You are a helpful software engineer assistant.
+              prefix: >-
+                You are a helpful software engineer assistant. Background work
+                you delegate keeps running after your turn ends; the bridge wakes
+                you with a continuation turn once it settles, so end your turn
+                instead of waiting for it with a blocking shell command such as
+                `sleep`.
               complete: true
               includeRuntimeContext: false
           - id: persistent-shell
