@@ -3,10 +3,10 @@ import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk'
 import type { SessionUpdate } from '@agentclientprotocol/sdk'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { SESSION_FORMAT_VERSION, SessionId, SessionSeq, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
-import { makeBridgeHarness, textResponse, type BridgeHarness } from './harness.ts'
+import { errorResponse, makeBridgeHarness, textResponse, type BridgeHarness } from './harness.ts'
 
 import { DESCENDANT_ACTIVITY_TITLE } from '../src/updates.ts'
-import { DESCENDANT_WAKE_LIMIT } from '../src/session.ts'
+import { DESCENDANT_WAKE_LIMIT, planDescendantReplay } from '../src/session.ts'
 
 type DescendantCardUpdate =
   | Extract<SessionUpdate, { sessionUpdate: 'tool_call' }>
@@ -213,6 +213,110 @@ describe('descendant history reload projection', () => {
     await harness.client.loadSession({ sessionId, cwd: process.cwd(), mcpServers: [] })
     expect(descendantCards(harness, sessionId, 'tool_call')).toHaveLength(0)
     expect(descendantCards(harness, sessionId, 'tool_call_update')).toHaveLength(0)
+  })
+
+  it('anchors each fate card at its spawn record instead of stacking the batch at the tail', async () => {
+    harness = await makeBridgeHarness({ script: [textResponse('parent done')] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    await harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] })
+    await harness.client.closeSession({ sessionId })
+    // The anchored child is the *later* spawn, so a projection still ordering by
+    // creation time would emit it second: the anchor must win over that order.
+    await persistChild(sessionId, 'child-early', 1, 'Audit the parser', 'completed')
+    await persistChild(sessionId, 'child-late', 2, 'Refactor the codec', 'completed')
+    const parentHandle = await harness.ctx.sessionPersistence.open(SessionId(sessionId), 'read')
+    let nextSeq: number
+    try {
+      nextSeq = Math.max(...(await parentHandle.read(0, undefined)).events.map(event => event.seq as number)) + 1
+    } finally {
+      await parentHandle.close()
+    }
+    const writer = await harness.ctx.sessionPersistence.open(SessionId(sessionId), 'write')
+    try {
+      await writer.append([{
+        type: 'subagent/catalog',
+        seq: nextSeq as never,
+        time: Date.now(),
+        data: { version: 0, childId: 'child-late', childCreatedAt: 2, mode: 'continuable', label: 'Codec audit' },
+      }] as unknown as readonly SessionEvent[])
+    } finally {
+      await writer.close()
+    }
+    harness.sessionUpdates.length = 0
+    await harness.client.loadSession({ sessionId, cwd: process.cwd(), mcpServers: [] })
+    expect(descendantCards(harness, sessionId, 'tool_call').map(update => update.toolCallId)).toEqual([
+      'dsh-subagent-child-late',
+      'dsh-subagent-child-early',
+    ])
+  })
+})
+
+describe('descendant replay placement', () => {
+  function rosterHeader(id: string, createdAt: number): SessionHeader {
+    return { id: SessionId(id), createdAt } as SessionHeader
+  }
+
+  function anchor(childId: unknown, seq: number): SessionEvent {
+    return { type: 'subagent/catalog', seq: seq as never, time: seq, data: { childId } } as unknown as SessionEvent
+  }
+
+  function assistantLine(text: string, seq: number): SessionEvent {
+    return {
+      type: 'assistant/message',
+      seq: seq as never,
+      time: seq,
+      data: {
+        turn: 1,
+        step: 0,
+        stream: [],
+        message: { id: `m${seq}`, role: 'assistant', content: [{ type: 'text', text }] },
+        usage: { inputTokens: 1, outputTokens: 1, cacheReadTokens: 0 },
+      },
+    } as unknown as SessionEvent
+  }
+
+  /** The plan rendered as a transcript: parent events as text, cards by child id. */
+  function transcript(plan: ReturnType<typeof planDescendantReplay>): string[] {
+    return plan.map(step => step.kind === 'event'
+      ? (step.event.data as { message?: { content: { text: string }[] } }).message?.content[0]?.text ?? step.event.type
+      : `card:${step.header.id}`)
+  }
+
+  it('places each card at its own spawn anchor', () => {
+    const plan = planDescendantReplay([
+      assistantLine('first', 1),
+      anchor('child-a', 2),
+      assistantLine('second', 3),
+      anchor('child-b', 4),
+      assistantLine('third', 5),
+    ], [rosterHeader('child-a', 1), rosterHeader('child-b', 2)])
+    expect(transcript(plan)).toEqual(['first', 'card:child-a', 'second', 'card:child-b', 'third'])
+  })
+
+  it('keeps descendants no anchor named in the tail, creation-ordered', () => {
+    const roster = [
+      rosterHeader('anchored', 1),
+      rosterHeader('older-tail', 2),
+      rosterHeader('newer-tail', 3),
+    ]
+    expect(transcript(planDescendantReplay([assistantLine('only', 1)], roster)))
+      .toEqual(['only', 'card:anchored', 'card:older-tail', 'card:newer-tail'])
+    expect(transcript(planDescendantReplay([anchor('anchored', 0), assistantLine('only', 1)], roster)))
+      .toEqual(['card:anchored', 'only', 'card:older-tail', 'card:newer-tail'])
+  })
+
+  it('grants a card only to rostered children and only once', () => {
+    const plan = planDescendantReplay([
+      anchor('foreign-child', 1),
+      anchor('child-a', 2),
+      anchor('child-a', 3),
+      anchor(undefined, 4),
+      anchor('', 5),
+      anchor(42, 6),
+      assistantLine('done', 7),
+    ], [rosterHeader('child-a', 1)])
+    expect(transcript(plan)).toEqual(['card:child-a', 'done'])
   })
 })
 
@@ -545,5 +649,199 @@ describe('continuable-descendant visibility', () => {
     // The bound is what keeps a delegation chain from holding the prompt open
     // forever, so the prompt must settle on the last turn the budget allows.
     expect(harness.adapter.requests).toHaveLength(turns)
+  })
+
+  it('rejects a failed turn instead of buying a continuation for its descendants', async () => {
+    // One scripted response only: any spurious continuation exhausts the mock
+    // and changes the rejection, so the request count alone is proof that the
+    // gate stayed shut once the turn had failed.
+    harness = await makeBridgeHarness({ script: [{ chunks: errorResponse('provider boom'), holdMs: 120 }] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const agent = harness.ctx.agents.get(SessionId(sessionId))!
+    const prompt = harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] })
+    const child = fakeDescendant(sessionId)
+    await harness.ctx.emit('agent/created', { agent: child, source: 'startup' })
+    await harness.ctx.emit('agent/status', { agent: child, status: 'running' })
+    await vi.waitFor(() => { expect(descendantCards(harness!, sessionId, 'tool_call')).toHaveLength(1) })
+    // The descendant is live before the turn runs and the turn has ended by the
+    // time the agent reports idle, so the failed turn really does finish inside
+    // an open descendant period.
+    await vi.waitFor(() => { expect(harness!.adapter.requests).toHaveLength(1) })
+    await vi.waitFor(() => { expect(agent.status).toBe('idle') })
+    // Prove the settlement is parked on that descendant — that is the exact
+    // state a continuation used to be issued from. Only then does releasing it
+    // put the wake decision itself to the test; releasing earlier would let the
+    // prompt settle before anyone looked at `endReason`.
+    let settled = false
+    void prompt.then(() => { settled = true }, () => { settled = true })
+    await new Promise(resolve => setTimeout(resolve, 60))
+    expect(settled).toBe(false)
+    await harness.ctx.emit('agent/status', { agent: child, status: 'idle' })
+    await expect(prompt).rejects.toThrow(/turn failed: provider boom/)
+    expect(harness.adapter.requests).toHaveLength(1)
+    // The failure settles no stats card, and the descendant's own card still
+    // closes through the ordinary idle path rather than being abandoned by the
+    // skipped continuation.
+    expect(harness.updates.some(update => 'toolCallId' in update && String(update.toolCallId).startsWith('dsh-stats-'))).toBe(false)
+    const settledCards = descendantCards(harness, sessionId, 'tool_call_update')
+    expect(settledCards).toHaveLength(1)
+    expect(settledCards[0]!.status).toBe('completed')
+  })
+
+  it('leaves the leftover descendant of a cancelled prompt out of the next gate', async () => {
+    harness = await makeBridgeHarness({ script: [textResponse('first'), textResponse('second')] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const first = harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] })
+    const child = fakeDescendant(sessionId)
+    await harness.ctx.emit('agent/created', { agent: child, source: 'startup' })
+    await harness.ctx.emit('agent/status', { agent: child, status: 'running' })
+    await vi.waitFor(() => {
+      expect(harness!.updates.some(update => update.sessionUpdate === 'agent_message_chunk')).toBe(true)
+    })
+    await harness.client.cancel({ sessionId })
+    await expect(first).resolves.toEqual({ stopReason: 'cancelled' })
+    // The leftover keeps running and keeps its card: cancellation abandons the
+    // request, not the visibility of the work it started.
+    expect(descendantCards(harness, sessionId, 'tool_call')).toHaveLength(1)
+    expect(descendantCards(harness, sessionId, 'tool_call_update')).toHaveLength(0)
+    // The next prompt must neither wait for that leftover nor wake for it. With
+    // the mark missing the gate never opens and this never resolves; with a
+    // wake the mock would serve a third request.
+    const second = await harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'again' }] })
+    expect(second.stopReason).toBe('end_turn')
+    expect(harness.adapter.requests).toHaveLength(2)
+    // Ignoring the leftover cost it nothing: its card is still open.
+    expect(descendantCards(harness, sessionId, 'tool_call_update')).toHaveLength(0)
+  })
+
+  it('keeps a turn the prompt never claimed out of its stats card', async () => {
+    harness = await makeBridgeHarness({
+      script: [
+        { chunks: textResponse('parent done'), holdMs: 120 },
+        textResponse('after descendants'),
+      ],
+    })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const agent = harness.ctx.agents.get(SessionId(sessionId))!
+    const child = fakeDescendant(sessionId)
+    const prompt = harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] })
+    await harness.ctx.emit('agent/created', { agent: child, source: 'startup' })
+    await harness.ctx.emit('agent/status', { agent: child, status: 'running' })
+    // Hold the prompt inside its settlement window: turn one has finished, the
+    // descendant has not, and nothing claims the slot in between.
+    await vi.waitFor(() => { expect(assistantText(harness!, sessionId)).toBe('parent done') })
+    await vi.waitFor(() => { expect(agent.status).toBe('idle') })
+    expect(descendantCards(harness, sessionId, 'tool_call_update')).toHaveLength(0)
+    const owned = agent.session.snapshotEvents().find(
+      (event): event is Extract<SessionEvent, { type: 'assistant/message' }> =>
+        event.type === 'assistant/message' && event.data.usage !== undefined,
+    )
+    expect(owned).toBeDefined()
+    // A second turn runs on this session that this prompt never claimed: the
+    // mock bills the same 5 in / 11 out again, which the card must not carry.
+    await harness.ctx.emit('session/event', agent.session, { type: 'turn/start', seq: SessionSeq(0), time: 0, data: { turn: 99 } })
+    await harness.ctx.emit('session/event', agent.session, { ...owned!, data: { ...owned!.data, turn: 99 } })
+    await harness.ctx.emit('session/event', agent.session, {
+      type: 'turn/end',
+      seq: SessionSeq(0),
+      time: 0,
+      data: { turn: 99, reason: { kind: 'completed' } },
+    })
+    await harness.ctx.emit('agent/status', { agent: child, status: 'idle' })
+    const result = await prompt
+    expect(result.stopReason).toBe('end_turn')
+    // Both turns this prompt did claim: 5 in / 11 out for `parent done` and
+    // 5 in / 17 out for `after descendants`. The unclaimed turn's own 5 / 11
+    // would push the card to 15 / 39 if it were folded in.
+    const statsCard = harness.updates.find(
+      update => update.sessionUpdate === 'tool_call' && 'toolCallId' in update && update.toolCallId === 'dsh-stats-2',
+    )
+    const title = statsCard !== undefined && 'title' in statsCard ? statsCard.title : ''
+    expect(title).toMatch(/↑ 10 · ↓ 28/)
+  })
+
+  it('releases the gate on its own descendant while a cancelled leftover stays active', async () => {
+    harness = await makeBridgeHarness({
+      script: [textResponse('first'), { chunks: textResponse('again'), holdMs: 120 }, textResponse('third')],
+    })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const agent = harness.ctx.agents.get(SessionId(sessionId))!
+    const first = harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] })
+    const orphan = fakeDescendant(sessionId)
+    await harness.ctx.emit('agent/created', { agent: orphan, source: 'startup' })
+    await harness.ctx.emit('agent/status', { agent: orphan, status: 'running' })
+    await vi.waitFor(() => {
+      expect(harness!.updates.some(update => update.sessionUpdate === 'agent_message_chunk')).toBe(true)
+    })
+    await harness.client.cancel({ sessionId })
+    await expect(first).resolves.toEqual({ stopReason: 'cancelled' })
+    // The leftover never goes idle, so the session's active count stays above
+    // zero for the rest of this test — precisely the condition under which a
+    // release keyed to that count would never fire again.
+    const second = harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'again' }] })
+    const own = fakeDescendant(sessionId)
+    await harness.ctx.emit('agent/created', { agent: own, source: 'startup' })
+    await harness.ctx.emit('agent/status', { agent: own, status: 'running' })
+    await vi.waitFor(() => { expect(descendantCards(harness!, sessionId, 'tool_call')).toHaveLength(2) })
+    await vi.waitFor(() => { expect(harness!.adapter.requests).toHaveLength(2) })
+    await vi.waitFor(() => { expect(agent.status).toBe('idle') })
+    // Parked on the descendant this prompt spawned, not on the leftover: the
+    // gate is non-empty, so the waiter really is queued right now.
+    let settled = false
+    void second.then(() => { settled = true }, () => { settled = true })
+    await new Promise(resolve => setTimeout(resolve, 60))
+    expect(settled).toBe(false)
+    // Releasing that one descendant is the whole test: a release keyed to the
+    // session total still sees the leftover and sleeps forever here.
+    await harness.ctx.emit('agent/status', { agent: own, status: 'idle' })
+    await expect(second).resolves.toEqual({ stopReason: 'end_turn' })
+    // Two turns were issued because an open gate for a successful turn buys its
+    // own continuation; the leftover, being excluded, never added a third.
+    expect(harness.adapter.requests).toHaveLength(3)
+    // Only the descendant this prompt waited for settles a card; the leftover's
+    // stays open, untouched by the gate that ignored it.
+    expect(descendantCards(harness, sessionId, 'tool_call_update')).toHaveLength(1)
+  })
+
+  it('lets a recreated same-id descendant back into the gate after disposal', async () => {
+    harness = await makeBridgeHarness({ script: [textResponse('first'), textResponse('again')] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const agent = harness.ctx.agents.get(SessionId(sessionId))!
+    const first = harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] })
+    const child = fakeDescendant(sessionId)
+    await harness.ctx.emit('agent/created', { agent: child, source: 'startup' })
+    await harness.ctx.emit('agent/status', { agent: child, status: 'running' })
+    await vi.waitFor(() => {
+      expect(harness!.updates.some(update => update.sessionUpdate === 'agent_message_chunk')).toBe(true)
+    })
+    await harness.client.cancel({ sessionId })
+    await expect(first).resolves.toEqual({ stopReason: 'cancelled' })
+    // Cancel marks it as a leftover, disposal forgets it, and the very same id
+    // is then born again. The mark belongs to the disposed period: without
+    // dropping it here the new period inherits it and is excluded from the gate
+    // for good — `onDescendantBorn` sets `known` before any reconcile pass
+    // could clear the mark, so nothing else ever would.
+    await harness.ctx.emit('agent/disposed', { agent: child })
+    await harness.ctx.emit('agent/created', { agent: child, source: 'startup' })
+    await harness.ctx.emit('agent/status', { agent: child, status: 'running' })
+    const second = harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'again' }] })
+    await vi.waitFor(() => { expect(harness!.adapter.requests).toHaveLength(2) })
+    await vi.waitFor(() => { expect(agent.status).toBe('idle') })
+    // Re-admitted, so the prompt waits on it; with the stale mark it would see
+    // an empty gate and settle the moment its own turn ended.
+    let settled = false
+    void second.then(() => { settled = true }, () => { settled = true })
+    await new Promise(resolve => setTimeout(resolve, 60))
+    expect(settled).toBe(false)
+    // Release through cancellation rather than waking, which keeps the request
+    // count at exactly the two turns this test actually issued.
+    await harness.client.cancel({ sessionId })
+    await expect(second).resolves.toEqual({ stopReason: 'cancelled' })
+    expect(harness.adapter.requests).toHaveLength(2)
   })
 })

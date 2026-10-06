@@ -199,8 +199,9 @@ interface InflightPrompt {
   agentError: Error | undefined
   stats: TurnStats | undefined
   /**
-   * Model this prompt's turns are pinned to, read at each `turn/start` while
-   * that turn's route is still pinned — the one that actually served the usage.
+   * Model this prompt's turns are pinned to, stamped when this prompt's own
+   * message is claimed into a turn — the earliest point at which the turn is
+   * known to belong to this prompt, and the route that served the usage.
    */
   statsModelId: string | undefined
   /** Bridge-issued continuation turns already spent by this prompt. */
@@ -221,6 +222,58 @@ function freshDescendantFacts(agent: Agent): DescendantFacts {
     periodFate: undefined,
     summary: undefined,
   }
+}
+
+/** One step of the reload replay: route a durable event, or place one fate card here. */
+export type DescendantReplayStep =
+  | { readonly kind: 'event'; readonly event: SessionEvent }
+  | { readonly kind: 'descendant'; readonly header: SessionHeader }
+
+/** The `subagent/catalog` payload read structurally, without the subagent package's typing. */
+interface SubagentCatalogFact {
+  readonly childId?: unknown
+}
+
+/**
+ * Interleave each descendant's settled fate card with the parent's own events.
+ *
+ * A delegated spawn commits a `subagent/catalog` record into the parent log at
+ * the position the spawn happened, naming the child session. Spending those
+ * records as anchors lands a reloaded client's cards where the live session
+ * opened them, instead of one block after the whole transcript. Roster members
+ * no anchor named stay in the tail, creation-ordered: a grandchild's anchor
+ * lives in its own parent's log, and a log written before the record existed
+ * has none at all.
+ *
+ * Anchors only choose a position, never eligibility — an id the persisted roster
+ * does not attribute to this session as delegated work earns no card, so a
+ * corrupt or borrowed record cannot publish foreign work into this transcript,
+ * and a duplicate anchor for a child already placed is inert.
+ * @param events - the session's complete persisted event log, in sequence order.
+ * @param descendants - this session's delegated descendants, creation-ordered.
+ * @returns the ordered replay plan.
+ */
+export function planDescendantReplay(
+  events: readonly SessionEvent[],
+  descendants: readonly SessionHeader[],
+): DescendantReplayStep[] {
+  const roster = new Map<string, SessionHeader>()
+  for (const header of descendants) roster.set(header.id, header)
+  const plan: DescendantReplayStep[] = []
+  for (const event of events) {
+    if ((event.type as string) !== 'subagent/catalog') {
+      plan.push({ kind: 'event', event })
+      continue
+    }
+    const childId = (event.data as unknown as SubagentCatalogFact | undefined)?.childId
+    if (typeof childId !== 'string' || childId.length === 0) continue
+    const header = roster.get(childId)
+    if (header === undefined) continue
+    roster.delete(childId)
+    plan.push({ kind: 'descendant', header })
+  }
+  for (const header of roster.values()) plan.push({ kind: 'descendant', header })
+  return plan
 }
 
 /** Standard invalid-parameter failure with protocol-safe detail. */
@@ -288,8 +341,16 @@ export class AcpSession {
   private readonly descendantBySession = new Map<SessionId, string>()
   /** Periodic reconciliation handle while any descendant is tracked; unref'd so it never holds the process. */
   private descendantTimer: ReturnType<typeof setInterval> | undefined
-  /** Resolvers released when the tracked descendants reach zero active or the prompt is cancelled. */
+  /** Resolvers released when the descendant gate empties — the held count, so a cancelled prompt's orphans no longer hold it — or the prompt is cancelled. */
   private descendantWaiters: (() => void)[] = []
+  /**
+   * Descendants a cancelled prompt left running. Their activity period belongs
+   * to a request that is already gone, so the next prompt must not wait for
+   * them and must not buy a wake-up for them — otherwise a cancelled prompt's
+   * background work holds every later prompt's settlement hostage. The mark is
+   * dropped once the descendant stops being active.
+   */
+  private readonly orphanedDescendants = new Set<string>()
 
   private constructor(
     private readonly ctx: Context,
@@ -1014,9 +1075,10 @@ export class AcpSession {
    * events stay the durable human transcript: a compaction summary node is a
    * model-only replacement copy, so replaying `user/message` events only for
    * direct human prompts both restores the pre-compaction conversation the
-   * client saw live and skips the summary it never saw. Every notification is
-   * delivered before this resolves, so a `session/load` response follows its
-   * history onto the wire.
+   * client saw live and skips the summary it never saw. Delegated work joins
+   * that transcript at its spawn anchor rather than in one tail block, per
+   * {@link planDescendantReplay}. Every notification is delivered before this
+   * resolves, so a `session/load` response follows its history onto the wire.
    * @param signal - replay cancellation observed by the storage read.
    */
   async replayStoredHistory(signal: AbortSignal): Promise<void> {
@@ -1028,7 +1090,13 @@ export class AcpSession {
     } finally {
       await handle.close()
     }
-    for (const event of events) {
+    const descendants = await this.listDelegatedDescendants(signal)
+    for (const step of planDescendantReplay(events, descendants)) {
+      if (step.kind === 'descendant') {
+        this.queueDescendantCard(step.header, signal)
+        continue
+      }
+      const event = step.event
       if (event.type === 'user/message') {
         if (event.data.source.kind !== 'user') continue
         const previous = this.outputTail
@@ -1043,17 +1111,23 @@ export class AcpSession {
       }
       this.onSessionEvent(this.agent.session, event)
     }
-    // Reload projection for continuable descendants: the persisted child
-    // sessions carry the background work's durable fate (a crash-orphaned turn
-    // receives its `interrupted` closer on resume), which the parent log never
-    // records. One settled fate card per descendant in the `origin: 'subagent'
-    // forest rides the replay tail — collected transitively to match the live
-    // routing's grandchild coverage — so a reloaded client cannot mistake
-    // interrupted work for the early-settled spawn call's "completed". Two
-    // contract assumptions live outside this repo's dependency tree: the spawn
-    // tool stamps both `parentSession` and `origin: 'subagent'` on children
-    // (the same headers the live routing and load gates already read), and
-    // fork lineage without the subagent origin stamp is not delegated work.
+    await this.outputTail
+  }
+
+  /**
+   * Read this session's delegated descendants out of the persisted roster.
+   *
+   * Three contract assumptions live outside this repo's dependency tree: the
+   * spawn tool stamps both `parentSession` and `origin: 'subagent'` on children
+   * (the same headers the live routing and load gates already read), fork
+   * lineage without the subagent origin stamp is not delegated work, and the
+   * roster is what makes a session a descendant — a spawn anchor naming an id
+   * the roster rejects surfaces no card, so borrowed or corrupt lineage cannot
+   * publish someone else's work into this transcript.
+   * @param signal - cancellation observed by the roster read.
+   * @returns every continuable-or-one-shot descendant, ordered by creation time.
+   */
+  private async listDelegatedDescendants(signal: AbortSignal): Promise<SessionHeader[]> {
     const headers = (await this.ctx.sessionPersistence.list({ signal })).map(({ header }) => header)
     const subagentChildren = new Map<SessionId, SessionHeader[]>()
     for (const header of headers) {
@@ -1062,7 +1136,8 @@ export class AcpSession {
       if (bucket === undefined) subagentChildren.set(header.parentSession, [header])
       else bucket.push(header)
     }
-    const children: SessionHeader[] = []
+    const sessionId = this.agent.session.id
+    const found: SessionHeader[] = []
     const visited = new Set<SessionId>([sessionId])
     let frontier: SessionId[] = [sessionId]
     while (frontier.length > 0) {
@@ -1073,38 +1148,54 @@ export class AcpSession {
           // bounds the walk against corrupt lineage data.
           if (visited.has(header.id)) continue
           visited.add(header.id)
-          children.push(header)
+          found.push(header)
           next.push(header.id)
         }
       }
       frontier = next
     }
-    children.sort((left, right) => left.createdAt - right.createdAt)
-    for (const header of children) {
-      if (signal.aborted) break
-      try {
-        const childHandle = await this.ctx.sessionPersistence.open(header.id, 'read', { signal })
+    found.sort((left, right) => left.createdAt - right.createdAt)
+    return found
+  }
+
+  /**
+   * Queue one descendant's settled fate card onto the ordered output tail, reading
+   * that child's own persisted log at delivery time so the replay loop never waits
+   * on storage for a card whose position is already fixed. A child log showing no
+   * work yields no card, and a failed read is contained: neither stops the replay.
+   * @param header - the descendant's persisted header.
+   * @param signal - replay cancellation observed by the child log read.
+   */
+  private queueDescendantCard(header: SessionHeader, signal: AbortSignal): void {
+    if (signal.aborted) return
+    const sessionId = this.agent.session.id
+    const persistence = this.ctx.sessionPersistence
+    const previous = this.outputTail
+    this.outputTail = previous
+      .then(async () => {
         let childEvents: readonly SessionEvent[]
         try {
-          childEvents = (await childHandle.read(0, undefined, { signal })).events
-        } finally {
-          await childHandle.close()
+          const childHandle = await persistence.open(header.id, 'read', { signal })
+          try {
+            childEvents = (await childHandle.read(0, undefined, { signal })).events
+          } finally {
+            await childHandle.close()
+          }
+        } catch (error: unknown) {
+          this.ctx.logger.warn(`acp: descendant history read failed for ${header.id}: ${errorChain(error)}`)
+          return
         }
         const cards = descendantHistoryFromEvents(header.id, childEvents)
-        if (cards === undefined) continue
-        const previous = this.outputTail
-        this.outputTail = previous.then(async () => {
-          for (const update of cards) {
-            await this.notify({ sessionId, update })
-          }
-        }).catch((error: unknown) => {
-          this.ctx.logger.warn(`acp: descendant history delivery failed: ${errorChain(error)}`)
-        })
-      } catch (error: unknown) {
-        this.ctx.logger.warn(`acp: descendant history read failed for ${header.id}: ${errorChain(error)}`)
-      }
-    }
-    await this.outputTail
+        if (cards === undefined) return
+        for (const update of cards) {
+          await this.notify({ sessionId, update })
+        }
+      })
+      /* v8 ignore start -- the bridge notifier contains transport rejection. */
+      .catch((error: unknown) => {
+        this.ctx.logger.warn(`acp: descendant history delivery failed: ${errorChain(error)}`)
+      })
+    /* v8 ignore stop */
   }
 
   /**
@@ -1113,7 +1204,15 @@ export class AcpSession {
    * @param turn - allocated Agent turn.
    */
   onInboxClaimed(message: UserMessage, turn: number): void {
-    if (this.inflight !== undefined && this.inflight.messageId === message.id) this.inflight.turn = turn
+    if (this.inflight !== undefined && this.inflight.messageId === message.id) {
+      this.inflight.turn = turn
+      // The claim is the only point where a turn is known to belong to this
+      // prompt: `turn/start` is appended before the inbox is claimed, so the
+      // old stamp there could not tell this prompt's turn from any other. It
+      // also runs before `pinTurn` below, so the read is the route the turn
+      // starts on — the same value the `turn/start` stamp used to take.
+      this.inflight.statsModelId = this.modelControl.selection.current?.model
+    }
     const selection = this.pendingSelections.get(message.id)
     this.pendingSelections.delete(message.id)
     if (selection !== undefined) this.modelControl.pinTurn(turn, selection)
@@ -1177,6 +1276,10 @@ export class AcpSession {
       this.refreshDescendantCard(agent.id)
     }
     this.reconcileDescendants()
+    // Repeats the release `reconcileDescendants()` has just performed: the gate
+    // can never exceed the active count, so `active === 0` implies `held === 0`
+    // and this can only fire identically, never earlier. Left in place so this
+    // method's own contract stays readable without stepping into the helper.
     if (this.activeDescendantCount() === 0) this.releaseDescendantWaiters()
   }
 
@@ -1245,14 +1348,22 @@ export class AcpSession {
     this.descendantStates.delete(agent.id)
     this.descendantFacts.delete(agent.id)
     this.descendantBySession.delete(agent.session.id)
+    // The orphan mark belongs to a period, and this one is over: dropping it
+    // here matters because the reconcile pass only sees an id that is absent or
+    // idle, while a same-id recreation sets `known` before any pass runs — the
+    // mark would then outlive disposal and keep excluding a brand-new activity
+    // period from the gate forever.
+    this.orphanedDescendants.delete(agent.id)
     // Facts/period counter notes: the counter stays monotonic across disposal
     // (a same-id recreation or late status must never reuse a settled card id)
     // and the timer disarms once nothing is actively held — an idle-but-alive
     // descendant must not keep the reconcile tick spinning.
-    if (this.activeDescendantCount() === 0) {
-      this.stopDescendantTimer()
-      this.releaseDescendantWaiters()
-    }
+    if (this.activeDescendantCount() === 0) this.stopDescendantTimer()
+    // A disposed descendant leaves the count whether or not it ever went idle,
+    // so this releases on the gate's count too: a cancelled prompt's leftover
+    // keeps the total above zero, and without this the waiting prompt would
+    // never wake even though everything it is waiting for is gone.
+    if (this.heldDescendantCount() === 0) this.releaseDescendantWaiters()
   }
 
   /** Await every update queued before this call. */
@@ -1263,21 +1374,20 @@ export class AcpSession {
   /**
    * Feed the live prompt's turn statistics while its events commit. A
    * `turn/start` under an in-flight prompt opens a fresh collector; its
-   * matching `turn/end` finalizes it into the prompt slot and the
-   * session-lifetime totals.
+   * matching `turn/end` finalizes it into the session-lifetime totals, and into
+   * the prompt's own slot only when that prompt had claimed the turn.
    * @param event - committed durable event.
    */
   private trackStats(event: SessionEvent): void {
     const inflight = this.inflight
     if (inflight === undefined) return
     if (event.type === 'turn/start') {
-      // Read the route while this turn still owns the pin: `selection.current`
-      // is the pair prompt assembly applies, so usage recorded after a mid-turn
-      // model option change is priced against the model that served it rather
-      // than the one the session has since selected. The turn start also stamps
-      // the slot, because settlement reads the pin only after `releaseTurn` has
-      // already handed it back to the live selection.
-      inflight.statsModelId = this.modelControl.selection.current?.model
+      // The collector still opens for every turn taken while a prompt is in
+      // flight: a turn no prompt owns is still this session's usage, and its
+      // `turn/end` below keeps feeding the session-lifetime totals. What it must not do is land in this prompt's
+      // card, and `turn/start` cannot tell — the inbox claim that correlates a
+      // turn to this prompt runs after it. Ownership is therefore checked where
+      // the turn is folded in, and the model stamp moved to `onInboxClaimed`.
       this.statsCollector = new TurnStatsCollector(
         event.data.turn,
         () => this.modelControl.selection.current?.model,
@@ -1294,9 +1404,15 @@ export class AcpSession {
       if (stats === undefined) return
       // A prompt can span several turns (a continuation issued after background
       // descendants settle), so the one card this prompt finally emits must
-      // carry the whole request: fold each turn into the prompt's aggregate
-      // while the session keeps its own per-turn fold.
-      inflight.stats = inflight.stats === undefined ? stats : mergeTurnStats(inflight.stats, stats)
+      // carry the whole request: fold each claimed turn into the prompt's
+      // aggregate while the session keeps its own per-turn fold. A turn that
+      // finished without this prompt claiming it ran in this session but not
+      // under this request, so it reaches the session totals alone — letting it
+      // through would bill the card for work a previous, cancelled prompt left
+      // behind.
+      if (event.data.turn === inflight.turn) {
+        inflight.stats = inflight.stats === undefined ? stats : mergeTurnStats(inflight.stats, stats)
+      }
       this.sessionStats = foldTurnStats(this.sessionStats, stats)
       return
     }
@@ -1318,8 +1434,8 @@ export class AcpSession {
     const end = inflight.endReason
     if (end === undefined || end.kind === 'error') return
     // The pin is gone by now (`turn/end` released it), so the model named on
-    // the card is the one stamped when the turn started, not whatever the
-    // session selects by the time settlement runs.
+    // the card is the one stamped when this prompt's message was claimed into
+    // the turn, not whatever the session selects by the time settlement runs.
     const modelId = inflight.statsModelId ?? this.modelControl.snapshot()?.model
     const updates: SessionUpdate[] = turnStatsCard(
       `dsh-stats-${stats.turn}`,
@@ -1386,6 +1502,7 @@ export class AcpSession {
       this.descendantPeriods.clear()
       this.descendantFacts.clear()
       this.descendantBySession.clear()
+      this.orphanedDescendants.clear()
       this.stopDescendantTimer()
       this.releaseDescendantWaiters()
       try {
@@ -1420,17 +1537,35 @@ export class AcpSession {
   }
 
   /**
-   * Resolve once no tracked descendant remains active. The promise is released
-   * either by the last activity period closing or by `cancelPrompt`, and the
-   * settlement loop re-checks the count itself, so a descendant that restarts
-   * before the re-check simply re-arms the wait.
+   * Active descendants the gate is answerable for: every open activity period
+   * except the ones a cancelled prompt left behind. Those belong to a request
+   * that is already gone, so they neither hold this prompt's settlement nor buy
+   * it a wake-up. Every other active period — including one this prompt's own
+   * turn has just opened — still counts, which is what keeps the release sites
+   * below behaving as before for work that was never orphaned.
+   */
+  private heldDescendantCount(): number {
+    let count = 0
+    for (const [id, state] of this.descendantStates) {
+      if (state === 'idle') continue
+      if (this.orphanedDescendants.has(id)) continue
+      count += 1
+    }
+    return count
+  }
+
+  /**
+   * Resolve once no descendant the gate is answerable for remains active. The
+   * promise is released either by the last of those periods closing or by
+   * `cancelPrompt`, and the settlement loop re-checks the count itself, so a
+   * descendant that restarts before the re-check simply re-arms the wait.
    */
   private whenDescendantsSettled(): Promise<void> {
-    if (this.activeDescendantCount() === 0) return Promise.resolve()
+    if (this.heldDescendantCount() === 0) return Promise.resolve()
     return new Promise(resolve => { this.descendantWaiters.push(resolve) })
   }
 
-  /** Release every descendant-gate waiter (activity emptied or prompt cancelled). */
+  /** Release every descendant-gate waiter (the gate's own count reached zero, or the prompt was cancelled). */
   private releaseDescendantWaiters(): void {
     const waiters = this.descendantWaiters
     this.descendantWaiters = []
@@ -1572,7 +1707,9 @@ export class AcpSession {
    * holding the descendant gate forever. A descendant whose ground truth is
    * genuinely still `running` stays held: the agreed semantics keep background
    * work from masquerading as a finished turn, and cancellation remains the
-   * only forced exit. The timer stops once nothing is tracked.
+   * only forced exit — it takes effect by marking whatever is still running as
+   * orphaned, which is what moves it out of this gate. The timer stops once
+   * nothing is tracked.
    * ponytail: a driver that died without disposal while its mirrored `status`
    * stays frozen at `running` is indistinguishable from a genuinely hung tool
    * call through the public event surface; both surface as a stalled card and
@@ -1587,10 +1724,20 @@ export class AcpSession {
       this.ctx.logger.warn(`acp: descendant ${agentId} observed ${state} but agent reports idle; reconciled`)
       this.settleDescendantCard(agentId)
     }
-    if (this.activeDescendantCount() === 0) {
-      this.stopDescendantTimer()
-      this.releaseDescendantWaiters()
+    // The orphan mark only has to outlive the request that created it, not the
+    // descendant: once its period is no longer open the mark is spent. Disposal
+    // drops its own mark in `onDescendantGone`; this pass is what catches a
+    // descendant that simply went idle.
+    for (const id of this.orphanedDescendants) {
+      const state = this.descendantStates.get(id)
+      if (state === undefined || state === 'idle') this.orphanedDescendants.delete(id)
     }
+    if (this.activeDescendantCount() === 0) this.stopDescendantTimer()
+    // Released on the gate's own count, not the session's: with a cancelled
+    // prompt's leftovers still running the total never reaches zero, and the
+    // waiter would then sleep through the periods it is actually waiting for.
+    // Waiters re-check their condition, so an extra release only re-arms.
+    if (this.heldDescendantCount() === 0) this.releaseDescendantWaiters()
   }
 
   /** Arm the periodic reconciliation timer while descendants are tracked; the
@@ -1620,6 +1767,15 @@ export class AcpSession {
     if (inflight === undefined) return
     inflight.cancelRequested = true
     inflight.admissionController.abort(new Error(detail))
+    // Whatever is still active when the request dies is treated as its leftover
+    // — a snapshot is the only signal available here, and it errs toward
+    // waiting less. Marking it orphaned is what keeps this prompt's own
+    // settlement and every later one from waiting for it or waking the agent
+    // for it. The cards stay open: the orphaned remainder is exactly what the
+    // client still needs to watch.
+    for (const [id, state] of this.descendantStates) {
+      if (state !== 'idle') this.orphanedDescendants.add(id)
+    }
     this.releaseDescendantWaiters()
     this.settleAfterQuiescence(inflight)
     if (inflight.messageQueued) this.agent.cancel({ kind: 'user' })
@@ -1632,7 +1788,7 @@ export class AcpSession {
       await inflight.admissionDone
       if (inflight.messageQueued) {
         // Hold the turn while continuable descendants still work: the prompt
-        // answers only after every spawned activity period goes idle, so the
+        // answers only after every non-orphan activity period goes idle, so the
         // client cannot mistake background work for a finished turn. Cancellation
         // skips the wait (agreed semantics: stop settles promptly, the open
         // activity cards keep the remainder visible).
@@ -1644,14 +1800,23 @@ export class AcpSession {
         // here — under the prompt that is already open, which therefore owns the
         // continuation's stop reason, cost, and output stream — removes that
         // need. The loop repeats only while each new turn again ends with
-        // descendants running, and stops at DESCENDANT_WAKE_LIMIT.
+        // descendants running, and stops at DESCENDANT_WAKE_LIMIT — or the
+        // moment the turn ends in failure, which is the one outcome a
+        // continuation must not paper over.
         for (;;) {
           await this.agent.whenIdle()
-          const held = !inflight.cancelRequested && this.activeDescendantCount() > 0
-          while (!inflight.cancelRequested && this.activeDescendantCount() > 0) {
+          const held = !inflight.cancelRequested && this.heldDescendantCount() > 0
+          while (!inflight.cancelRequested && this.heldDescendantCount() > 0) {
             await this.whenDescendantsSettled()
           }
           if (inflight.cancelRequested || !held) break
+          // A failed turn has to surface its own error. Waking here would clear
+          // `endReason` and let a later turn's stop reason stand in for it, so
+          // the prompt would resolve as if it had succeeded. Only the
+          // continuation is skipped: the wait above has already run the gate to
+          // empty, so every descendant this prompt was waiting for has settled
+          // its card normally, and settlement below rejects with the failure.
+          if (inflight.endReason?.kind === 'error') break
           if (inflight.continuations >= DESCENDANT_WAKE_LIMIT) break
           this.wakeForSettledDescendants(inflight)
         }
