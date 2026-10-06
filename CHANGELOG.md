@@ -3,6 +3,12 @@
 本项目的所有显著变更都会记录在此文件。本格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0)，
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/1.1.0/)；各版本日期为 UTC 发布日。
 
+## [未发布]
+
+### 修复
+
+- 斜杠命令此前只被「列出」而从不「执行」：`available_commands_update` 已经把宿主命令注册表的目录发给客户端，但标准 ACP 客户端把选中的命令当普通 `session/prompt` 文本送回，bridge 此前一律当散文 `agent.followup()` 交给模型。于是每条宿主命令都被降级成一次「模型是否恰好选择对应工具调用」——那次调用既受部署挂载的审查/审批策略拦截，又消耗模型通道。这在 goal 自动轮次里是致命的：`/goal pause` 是中止自主 goal run 唯一的带内手段，而经模型执行意味着「停止风暴」要依赖风暴正在烧掉的那条通道。实测一次风暴中，`dsh-experimental-auto-review` 的 reviewer 调用绕过 `llm/retry`（该中间件只挂在 `agent/request-error` 上），上游 429 被 `failed()` 物化成「审查拒绝，调用体未执行」，`get_goal`/`update_goal` 连续 11 次被同因拒绝，模型既读不到 revision 也无法 compare-and-set 暂停 goal，`dsh-goal-round-driver` 于是按 `active`+`armed` 一路续跑到 `maxGoalRounds`（默认 256）——而这整段里唯一零 LLM 的出口没有被任何 ACP 传输接上：整棵 dsh 树里 `commands.execute` 的调用方只有 `dsh-api-session-controller` 与 `dsh-client-ui-commands`（Web/API 平面），没有任何 ACP 平面调用它。现在 bridge 在 `session/prompt` 里识别注册表能解析的命令行并交给注册表执行：不开轮次、不走准入、不计统计，handler 文本以 assistant 消息块按执行配对 id 返回，以 `end_turn` 结束，命令因此既不被工具闸门拦截也不受模型限流影响。handler 抛错同样以文本回报并结束轮次，不退回模型（已追加 `command/run` 的 handler 此刻已持有领域状态，退回会二次执行）。两种形态保持原有散文路径不变：多于一个块的 prompt（注册表的附件准入是另一套契约，此处不重复实现）与注册表解析不出的名字（未注册的 `/word` 不被吞掉，照原样送达模型）。命令不开轮次、不占 `inflight` 槽，故并发守卫补一个 `commandRunning` 标志，避免第二个 prompt 在 handler 执行期间穿过守卫。
+
 ## [0.3.3] - 2026-10-05
 
 ### 新增

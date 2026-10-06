@@ -127,6 +127,16 @@ A skill needs no dispatch from the bridge: typing `/skill-name` in a message is 
 
 This plugin's bundle leaves the composition alone. In the default `zed` profile `skill-filesystem` (the local provider) and `tool-skill` (the model-facing tool) are still disabled, so a deployment has to mount a provider to see any skills. A failed catalog read only logs a warning; the command roster still ships.
 
+## Run a host command from the composer
+
+A standard ACP client submits the command you pick from the roster as an ordinary `session/prompt` line. When the host command registry resolves that line, the bridge hands it to the registry instead of the model, so the command runs against its own domain, appends its own `command/run` and `command/done` records, and settles the prompt with `end_turn` — no turn, no admission, no stats.
+
+This matters most when the model route is unhealthy. A command routed through the model would depend on the model choosing the matching tool call, and that call is both gated by whatever review or approval policy the deployment mounts and billed to the model route, so `/goal pause` could be refused or rate-limited at exactly the moment you need it. On the host plane it needs neither.
+
+The handler's text comes back as an assistant message chunk, grouped under the execution's pairing id. A handler that throws is reported the same way and ends the turn rather than falling through to the model, because a handler that already appended `command/run` owns domain state by then.
+
+Two shapes stay on the prose path, exactly as before: a prompt carrying more than one block (the registry's attachment admission is a separate contract the bridge does not reimplement here), and a name the registry does not resolve — an unregistered `/word` is not swallowed, it reaches the model as written.
+
 ## Serve self-configured models
 
 The Model select lists the live provider directory of the profile behind this agent (`dsh --profile zed`). dsh mounts `dsh-llm-pi-ai` dormant in the base composition: it registers no routes until a settings section or patch declares provider profiles, and settings sections are per-profile — models configured on another profile's Models page never reach this one.

@@ -127,6 +127,16 @@ skill 不需要 bridge 派发：在消息里直接敲 `/skill-name` 走的是 ha
 
 本插件的 bundle 不改动组合：默认 `zed` profile 下 `skill-filesystem`（本地来源）与 `tool-skill`（模型侧工具）仍是禁用的，所以要看到 skill 需要部署方自己挂载 provider。目录读取失败只会记一条 warn，命令目录照常送达。
 
+## 在输入框里执行宿主命令
+
+标准 ACP 客户端把你在目录里选中的命令，当成一条普通的 `session/prompt` 文本发回来。当宿主命令注册表能解析这一行时，bridge 把它交给注册表而不是模型：命令直接作用于自己的领域，自己追加 `command/run` 与 `command/done` 记录，并以 `end_turn` 结束这次 prompt——不开轮次、不走准入、不计统计。
+
+模型通道不健康时这一点最要紧。绕道模型执行命令，取决于模型自己选择对应的工具调用；而那次调用既受部署挂载的审查/审批策略拦截，又消耗模型通道，于是 `/goal pause` 恰恰在最需要它的时刻可能被拒或被限流。走宿主平面则两者都不需要。
+
+handler 的文本以 assistant 消息块返回，按执行配对 id 归组。handler 抛错时同样以文本回报并结束该轮次，不会退回模型——因为已经追加了 `command/run` 的 handler 此刻已经持有领域状态。
+
+有两种形态仍走原来的散文路径：多于一个块的 prompt（注册表的附件准入是另一套契约，bridge 不在这里重复实现），以及注册表解析不出的名字——未注册的 `/word` 不会被吞掉，照原样送到模型。
+
 ## 使用自配模型
 
 模型选择器列出的是本 agent 背后 profile（`dsh --profile zed`）的**活跃** provider 目录。dsh 在基础组合中以 dormant 状态挂载 `dsh-llm-pi-ai`：在某个 settings 段或 patch 声明 provider profiles 之前它不注册任何路由，而 settings 段按 profile 隔离——在其他 profile 模型页配置的模型永远不会到达这个 profile。

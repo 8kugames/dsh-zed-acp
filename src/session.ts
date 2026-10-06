@@ -30,6 +30,7 @@ import {
 } from '@deepseek-ai/dsh-session'
 import { buildForkSeed } from '@deepseek-ai/dsh-session/fork'
 import { AcpContentError, admitAcpPrompt } from './content.ts'
+import { acpCommandLine, commandResultUpdate } from './commands.ts'
 import { turnEndToStopReason } from './codec.ts'
 import { acpConfigOptions } from './config-options.ts'
 import { inclusiveHistoryPrefix, locateForkBoundary, type JetbrainsAirForkRequest } from './fork.ts'
@@ -262,6 +263,13 @@ export class AcpSession {
   private readonly modelControl: AcpModelControl
   private outputTail = Promise.resolve()
   private inflight: InflightPrompt | undefined
+  /**
+   * Whether a slash command is mid-dispatch. A command opens no turn and takes
+   * no `inflight` slot, so this is what keeps a second `session/prompt` from
+   * passing the concurrency guard while the first one is still running a
+   * handler against a host domain.
+   */
+  private commandRunning = false
   private closing: Promise<void> | undefined
   private readonly pendingSelections = new Map<string, ModelSelection>()
   private statsCollector: TurnStatsCollector | undefined
@@ -630,6 +638,78 @@ export class AcpSession {
   }
 
   /**
+   * Run one slash command the client submitted as a prompt, when the host
+   * command registry resolves it.
+   *
+   * A standard ACP client picks a command from the roster this bridge already
+   * publishes and sends the chosen line back as ordinary prompt content. The
+   * registry owns the command's whole execution — it appends the `command/run`
+   * and `command/done` lifecycle records and hands the handler the live agent —
+   * so the command never becomes a model message and never reaches a tool
+   * gate. That is what keeps a command working while the model route is
+   * rate-limited, and it is the only reason `/goal pause` can stop an
+   * autonomous goal run whose rounds are failing every tool call.
+   *
+   * Nothing about the turn path is borrowed: no prompt slot is taken, no
+   * admission runs, no turn starts, so there is no stop reason to reconcile
+   * and no stats to settle. The handler's own text is the whole deliverable.
+   * @param params - standard ACP prompt request for this session.
+   * @param signal - JSON-RPC request cancellation signal.
+   * @returns the stop reason to answer with, or `undefined` when the prompt is
+   *   ordinary prose and must continue to the model.
+   */
+  private async dispatchCommand(
+    params: PromptRequest,
+    signal: AbortSignal,
+  ): Promise<StopReason | undefined> {
+    const commands = this.ctx.get('commands')
+    if (commands === undefined) return undefined
+    const line = acpCommandLine(params.prompt)
+    if (line === undefined) return undefined
+    this.commandRunning = true
+    try {
+      if (signal.aborted) return 'cancelled'
+      // An unresolved name is not a command this bridge swallowed: the registry
+      // declines it and the line stays prose, exactly as it does today.
+      const execution = await commands.execute(this.agent, line, [], signal)
+      if (execution === undefined) return undefined
+      const update = commandResultUpdate(execution)
+      if (update !== undefined) {
+        const previous = this.outputTail
+        const delivery = previous.then(() => this.notify({
+          sessionId: this.agent.session.id,
+          update,
+        }))
+        this.outputTail = delivery.catch((error: unknown) => {
+          this.ctx.logger.warn(`acp: slash-command result delivery failed: ${errorChain(error)}`)
+        })
+        await this.outputTail
+      }
+      return 'end_turn'
+    } catch (error: unknown) {
+      // A handler that already appended `command/run` owns domain state by the
+      // time it throws, so falling through to the model would run the command's
+      // intent a second time. Report the failure and end the turn instead.
+      this.ctx.logger.warn(`acp: slash command "${line}" failed: ${errorChain(error)}`)
+      const previous = this.outputTail
+      const delivery = previous.then(() => this.notify({
+        sessionId: this.agent.session.id,
+        update: {
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: `/${line.slice(1)} failed: ${errorChain(error)}` },
+        },
+      }))
+      this.outputTail = delivery.catch((notifyError: unknown) => {
+        this.ctx.logger.warn(`acp: slash-command failure delivery failed: ${errorChain(notifyError)}`)
+      })
+      await this.outputTail
+      return signal.aborted ? 'cancelled' : 'end_turn'
+    } finally {
+      this.commandRunning = false
+    }
+  }
+
+  /**
    * Admit, enqueue, and settle one prompt at whole-Agent quiescence.
    * @param params - standard ACP prompt request for this session.
    * @param imageEnabled - connection capability advertised at initialization.
@@ -642,7 +722,12 @@ export class AcpSession {
     requestSignal?: AbortSignal,
   ): Promise<PromptResponse> {
     this.assertActive()
-    if (this.inflight !== undefined) throw invalidParams('a prompt is already in flight for this session')
+    if (this.inflight !== undefined || this.commandRunning) throw invalidParams('a prompt is already in flight for this session')
+    // A slash command the host registry resolves runs on the host plane and
+    // settles without a turn, so it answers here rather than opening the
+    // prompt slot below. Prose falls through untouched.
+    const command = await this.dispatchCommand(params, requestSignal ?? new AbortController().signal)
+    if (command !== undefined) return { stopReason: command }
     const completion = Promise.withResolvers<StopReason>()
     const admission = Promise.withResolvers<void>()
     const admissionController = new AbortController()

@@ -310,6 +310,45 @@ export interface BridgeHarnessPresets {
   readonly stub: StubAgentPresetRegistry
 }
 
+/**
+ * Minimal command-registry stand-in: the roster `available_commands_update`
+ * publishes plus the executor `session/prompt` dispatches into. Mirrors the
+ * real grammar — an unregistered name declines, so the caller keeps the line as
+ * prose — and records every executed line so a test can assert the handler ran
+ * without the model ever seeing the prompt.
+ */
+export class StubCommandRegistry {
+  /** Registered command names, in the order the roster reports them. */
+  readonly names: string[] = []
+  /** Every line a resolved command executed, in order. */
+  readonly executed: string[] = []
+  /** When set, `execute` rejects with this failure instead of settling. */
+  failure: Error | undefined
+  /** The text the executor settles with, per registered name. */
+  readonly results = new Map<string, { kind: 'success'; text?: string } | { kind: 'error'; text: string }>()
+
+  /** Register one command name the executor will resolve. */
+  register(name: string, result: { kind: 'success'; text?: string } | { kind: 'error'; text: string }): void {
+    this.names.push(name)
+    this.results.set(name, result)
+  }
+
+  list(): { name: string; description: string }[] {
+    return this.names.map(name => ({ name, description: `stub command ${name}` }))
+  }
+
+  async execute(_agent: unknown, line: string, _attachments: readonly unknown[], _signal: AbortSignal): Promise<{
+    commandId: string
+    result: { kind: 'success'; text?: string } | { kind: 'error'; text: string }
+  } | undefined> {
+    if (this.failure !== undefined) throw this.failure
+    const name = /^\/([a-z][a-z0-9_-]*)/u.exec(line)?.[1]
+    if (name === undefined || !this.results.has(name)) return undefined
+    this.executed.push(line)
+    return { commandId: `cmd-${this.executed.length}`, result: this.results.get(name)! }
+  }
+}
+
 /** In-memory durable store for ACP wire-order and lifecycle tests. */
 class MemoryAttachmentStore extends AttachmentStore {
   readonly imageLimits = IMAGE_LIMITS
@@ -408,6 +447,8 @@ export interface BridgeHarness {
   permissions: StubPermissionPresets | undefined
   /** The mounted stub skill registry; undefined unless the option mounted one. */
   skills: StubSkillRegistry | undefined
+  /** The mounted stub command registry; undefined unless the option mounted one. */
+  commands: StubCommandRegistry | undefined
   permissionRequests: RequestPermissionRequest[]
   elicitationRequests: CreateElicitationRequest[]
   persistenceRoot: string
@@ -469,6 +510,8 @@ export async function makeBridgeHarness(options: {
   defaultModel?: { provider: string; model: string }
   /** Mount the stub skill registry, as a deployment mounting dsh-skill does. */
   skills?: boolean
+  /** Mount the stub command registry, as the shipped dsh-base bundle does. */
+  commands?: boolean
 } = {}): Promise<BridgeHarness> {
   const adapter = new MockAdapter(options.script ?? [], options.imageCapable === true)
   const ctx = new Context()
@@ -495,6 +538,8 @@ export async function makeBridgeHarness(options: {
   if (stubPermissions !== undefined) ctx.provide('permissionPresets', stubPermissions as unknown as PermissionPresetService)
   const stubSkills = options.skills === true ? new StubSkillRegistry() : undefined
   if (stubSkills !== undefined) ctx.provide('skills', stubSkills as never)
+  const stubCommands = options.commands === true ? new StubCommandRegistry() : undefined
+  if (stubCommands !== undefined) ctx.provide('commands', stubCommands as never)
   if (options.defaultModel !== undefined) {
     // The real service reads volatile per-profile settings; the stub detaches one fixed selection.
     ctx.provide('agentDefaultModel', { currentSelection: () => ({ ...options.defaultModel }) } as never)
@@ -526,6 +571,7 @@ export async function makeBridgeHarness(options: {
     presets: stubPresets,
     permissions: stubPermissions,
     skills: stubSkills,
+    commands: stubCommands,
     persistenceRoot,
     onPermission: () => ({ outcome: { outcome: 'cancelled' } }),
     onElicitation: () => ({ action: 'cancel' }),
