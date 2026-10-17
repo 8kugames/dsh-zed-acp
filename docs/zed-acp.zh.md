@@ -15,7 +15,7 @@
 把 CLI 钉到插件对应的版本，把 Zed ACP 插件装进一个 profile，再在 Zed 的 `settings.json` 中注册该 profile：
 
 ```sh
-npm install -g @deepseek-ai/dsh@0.2.0-rc.2
+npm install -g @deepseek-ai/dsh@0.2.1-rc.2
 dsh plugin --profile zed add @8kugames/dsh-zed-acp
 ```
 

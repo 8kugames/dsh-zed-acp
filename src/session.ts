@@ -151,10 +151,10 @@ export interface ForkAcpSessionOptions extends AcpSessionBuildOptions {
   fork: JetbrainsAirForkRequest | undefined
 }
 
-/** The continuable-subagent teardown used without depending on the subagent package. */
-interface ContinuableDrain {
-  /** Dispose continuable descendants below exact host-owned parents child-first. */
-  drainContinuableDescendants(parents: readonly Agent[]): Promise<void>
+/** The subagent teardown used without depending on the subagent package. */
+interface DescendantDrain {
+  /** Dispose descendants below exact host-owned parents, child-first. */
+  drainDescendants(parents: readonly Agent[]): Promise<void>
 }
 
 /**
@@ -1486,9 +1486,9 @@ export class AcpSession {
       } catch (error: unknown) {
         failures.push(new Error('ACP session activity drain failed', { cause: error }))
       }
-      const subagents = this.ctx.get('subagents') as ContinuableDrain | undefined
+      const subagents = this.ctx.get('subagents') as DescendantDrain | undefined
       try {
-        await subagents?.drainContinuableDescendants([this.agent])
+        await subagents?.drainDescendants([this.agent])
       } catch (error: unknown) {
         this.ctx.logger.warn(`acp: continuable subagent teardown failed: ${errorChain(error)}`)
         failures.push(new Error('continuable subagent teardown failed', { cause: error }))

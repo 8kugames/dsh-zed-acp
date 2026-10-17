@@ -34,7 +34,7 @@ import type { AgentPresetRow } from '@deepseek-ai/dsh-agent-preset-registry/type
 import type { PermissionPresetService } from '@deepseek-ai/dsh-permission-presets'
 import { PlanModeController } from '@deepseek-ai/dsh-plan-mode'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
-import JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
+import * as JsonlSessionPersistence from '@deepseek-ai/dsh-session-persistence-jsonl'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
 import { UserQuestionService } from '@deepseek-ai/dsh-user-questions'

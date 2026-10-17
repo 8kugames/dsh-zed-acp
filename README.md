@@ -9,13 +9,13 @@ freely installable dsh plugin. It turns `dsh` into an external agent that
 reasoning, tool calls with real diffs, plan mode, agent presets, permission
 presets, session history, and MCP servers.
 
-Built and tested against dsh `0.2.0-rc.2`. The plugin composes over the
+Built and tested against dsh `0.2.1-rc.2`. The plugin composes over the
 installed harness — it ships no runtime of its own and never pins your key in
 editor config.
 
 ## Install
 
-Prerequisites: [dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) pinned to the version the plugin targets (`npm i -g @deepseek-ai/dsh@0.2.0-rc.2` — the npm `latest` tag may trail it), Node `^22.19 || >=24`, and Zed.
+Prerequisites: [dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) pinned to the version the plugin targets (`npm i -g @deepseek-ai/dsh@0.2.1-rc.2` — the npm `latest` tag may trail it), Node `^22.19 || >=24`, and Zed.
 
 Install from the npm registry:
 
@@ -163,10 +163,11 @@ Cumulative totals cover live turns since the agent process opened the session �
 
 ## Compatibility
 
-Peer ranges declare `~0.2.0-rc.2`: any dsh in the 0.2.x line from
-`0.2.0-rc.2` on is accepted; dsh's profile boot checks them at install and
-boot and names an incompatible plugin loudly. All `@deepseek-ai/*` modules
-load from the host installation — the plugin ships no runtime.
+Peer ranges declare `~0.2.1-rc.2`: any dsh in the 0.2.x line at or above
+`0.2.1` is accepted, plus this `0.2.1-rc.2` build itself; an earlier prerelease
+such as `0.2.0-rc.2` is not. dsh's profile boot checks them at install and boot
+and names an incompatible plugin loudly. All `@deepseek-ai/*` modules load from
+the host installation — the plugin ships no runtime.
 
 Client-facing extensions degrade gracefully: the display terminal, plan,
 session-title, and slash-command projections use only standard ACP updates

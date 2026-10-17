@@ -8,7 +8,7 @@
   "license": "MIT",
   "distribution": {
     "npx": {
-      "package": "@deepseek-ai/dsh@0.2.0-rc.2",
+      "package": "@deepseek-ai/dsh@0.2.1-rc.2",
       "args": ["--profile", "zed"]
     }
   }

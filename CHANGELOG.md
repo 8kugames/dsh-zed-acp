@@ -3,6 +3,22 @@
 本项目的所有显著变更都会记录在此文件。本格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0)，
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/1.1.0/)；各版本日期为 UTC 发布日。
 
+## [Unreleased]
+
+### 新增
+
+- `@deepseek-ai/dsh-subagent` 进入可选 peer 声明（`~0.2.1-rc.2`，`peerDependenciesMeta` 标 `optional`）。本仓通过 `ctx.get('subagents')` 窄化消费该宿主服务、不 import 该包，所以它此前不在 `package.json` 的任何依赖面上：dsh 的版本闸门对这个服务完全看不见，上游改名也不会有任何安装期或类型期信号。声明之后，profile 安装在合成阶段就会核对宿主是否带上了版本相符的 `dsh-subagent`，本批那条 `drainDescendants` 更名这类破坏从此有了一道自动检查。穷举本仓全部 13 个 `ctx.get` 服务后确认其余 12 个（`llm`/`credentials`/`attachments`/`commands`/`skills`/`agentPresets`/`agentDefaultModel`/`permissionPresets`/`planMode`/`sessionProjections`/`sessionProjectionCache`/`tokenMeter`）的属主包都已在 peers 里，`dsh-subagent` 是唯一的漏项。因为是 optional，未装子代理能力的部署照旧可跑，npm 也不会把它拉进插件自己的 `node_modules`。
+
+### 变更
+
+- 依赖基线从 dsh `0.2.0-rc.2` 抬到 `0.2.1-rc.2`：直接依赖 `@deepseek-ai/dsh-brand`、34 项 peer 与全部开发依赖整体重钉，`@deepseek-ai/cordis` 随之抬到 `~4.0.5`、`@deepseek-ai/schemastery` 抬到 `~3.18.5`。后两项不是自选升级——上游 0.2.1-rc.2 全家桶已把自己对 cordis 的下限从 `~4.0.4` 抬到 `~4.0.5`、对 schemastery 从 `~3.18.4` 抬到 `~3.18.5`（cordis 4.0.4 与 4.0.5 的 tarball 除 README 与 package.json 外零代码差异，抬的是声明而非行为），插件停在旧下限会在宿主侧凑不出一致的运行时。peer 区间必须重钉而不能指望旧区间放行：`semver.satisfies('0.2.1-rc.2', '~0.2.0-rc.2')` 实测为 `false`（预发布候选只有在区间的某一侧带同 [major, minor, patch] 元组时才被接受），新的 `~0.2.1-rc.2` 接受 `0.2.1` 及以上的 0.2.x 正式版本身与本次 `0.2.1-rc.2`，拒绝 `0.2.0-rc.2` 与 `0.2.2-rc.1` 这类跨线/更早的预发布。`registry/agent.json` 的运行时钉版、两份 README 的构建基线与安装命令、两份 docs 的安装指引与兼容性段落、`THIRD_PARTY_NOTICES.md` 的两条版本行同步升至新基线。**影响**：仍把 dsh 钉在 `0.2.0-rc.2` 的宿主不再满足本插件的 peer 区间，profile 启动会明确报出不兼容并把插件排除在合成之外。
+- 测试夹具挂载 JSONL 持久化后端的形态跟随上游改为函数式插件：`@deepseek-ai/dsh-session-persistence-jsonl` 在 0.2.1-rc.2 从 `export default class JsonlSessionPersistence extends SessionPersistence` 改为导出 `name`/`Config`/`apply(ctx, config)` 三件套，默认导入因此消失。`tests/harness.ts` 改用命名空间导入把整个模块作为 `{ apply }` 对象插件交给 `ctx.plugin()`，配置面（`root`、`compression: 'none'`）不变。仅影响测试基座；运行时侧本仓不挂载该后端，它由宿主 profile 提供。
+- 会话关闭的后代清理改调上游改名后的方法：`@deepseek-ai/dsh-subagent` 的 `drainContinuableDescendants(parents)` 在 0.2.1-rc.2 更名为 `drainDescendants(parents)`（同包 `dsh-subagent-in-process-driver` 已被上游移除）。本仓以 `ctx.get('subagents')` 就地窄化该服务、不依赖子代理包，因此这个改名不在 `package.json` 的依赖面上、也不在类型面上：**typecheck 与全部 348 个用例都在旧名字下通过**（`tests/dispose.spec.ts` 的替身按同一个旧名字提供方法，与本仓的窄化声明自洽）。真机 `dsh --profile zed` 的 `session/close` 才暴露它——每个会话关闭都回 `continuable subagent teardown failed: subagents?.drainContinuableDescendants is not a function`，Zed 侧每次结束会话都会撞到。**修复**：窄化声明与调用点改为 `drainDescendants`，替身同步改名。**影响**：会话关闭恢复干净返回；后台后代的先子后父释放顺序不变（该顺序由 `tests/dispose.spec.ts` 的 11 个用例守着，真机看不出顺序只看得出成败）。
+
+### 移除
+
+- 部署 persona 不再声明工作目录。`presets/` 的 standard/ptc/cordis 三份预设的 persona `suffix` 以 `Your working directory is {{cwd}}.` 开头，`cordis.patch.yml` 的 `system-prompt` 层也写着同句 `personaSuffix`。上游 0.2.1-rc.2 把 `cwd` 提示变量从 `dsh-agent-loop` 撤走（现在只注册 `provider` 与 `model`），改由新包 `@deepseek-ai/dsh-working-directory` 逐请求注入 `Current working directory: <绝对路径>` 的**必需用户上下文**，并在其 README 明确「Directory context stays outside the system prompt」「`includeRuntimeContext: false` 时仍然送达」。提示变量的解析是严格的，预设里留着这句会让每个回合直接失败：真机实测把改版前的 `presets/standard.patch.yml` 作为覆盖层喂给 `dsh --profile zed`，回合报 `unknown prompt variable "{{cwd}}" in section "deployment:persona-suffix"; registered variables: provider, model`。profile 层那句是另一回事——它被每个会话的预设 persona 行遮蔽（真机实测把带标记的 prefix/suffix 写回 `system-prompt` 行，发出的系统提示里两个标记都不出现），删掉它清的是一个指向已撤变量的死配置。工作目录的信息没有因此丢失：改版后的真机系统提示不含目录句，而模型请求的用户上下文含 `Current working directory: "/tmp"`，这正是上游把目录移出稳定前缀的设计意图，`dsh-base` 0.2.1-rc.2 已挂载该包。`minimal` 预设本就 `complete: true`、不带此句；预设里关于后台委派续跑的引导句一字未改（真机系统提示尾部可见）。`docs/` 关于「预设已在 persona 段写明续跑契约」的表述随之仍然成立。
+
 ## [0.3.4] - 2026-10-06
 
 ### 修复

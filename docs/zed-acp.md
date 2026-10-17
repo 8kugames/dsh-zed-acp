@@ -15,7 +15,7 @@ This tutorial connects the [Zed](https://zed.dev) editor to DeepSeek Harness ove
 Install the CLI pinned to the version the plugin targets, add the Zed ACP plugin to a profile, and register the profile in your Zed `settings.json`:
 
 ```sh
-npm install -g @deepseek-ai/dsh@0.2.0-rc.2
+npm install -g @deepseek-ai/dsh@0.2.1-rc.2
 dsh plugin --profile zed add @8kugames/dsh-zed-acp
 ```
 
