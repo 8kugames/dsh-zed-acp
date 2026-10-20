@@ -12,6 +12,7 @@ on:
       - 'src/**'
       - 'tests/**'
       - '.github/workflows/zed-acp.yml'
+  workflow_dispatch:
 
 concurrency:
   group: zed-acp-${{ github.ref }}
