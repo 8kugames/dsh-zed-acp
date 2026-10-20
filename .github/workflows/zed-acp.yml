@@ -63,6 +63,6 @@ jobs:
       # prepare hook, so dist/ must be built here; needs: test only gates the
       # run and does not carry artifacts from the test job's runners.
       - run: npm run build
+      # Trusted publishing exchanges the Actions OIDC token for a short-lived
+      # credential; setting NODE_AUTH_TOKEN here would disable that path.
       - run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

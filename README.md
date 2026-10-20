@@ -232,8 +232,9 @@ The dev loop is `npm run build` + restart the Zed agent. For poking a live bridg
 1. Bump `version` in `package.json` and `registry/agent.json` together.
 2. Commit, then push the tag: `git tag zed-acp-v<version> && git push origin zed-acp-v<version>`.
 3. The workflow `.github/workflows/zed-acp.yml` runs the three-platform test
-   matrix on the tag and publishes to npm when `NPM_TOKEN` is configured; it
-   asserts that the tag matches both manifest versions.
+   matrix on the tag and publishes to npm through Trusted Publishing (OIDC);
+   no long-lived npm token is stored in the repository. It asserts that the tag
+   matches both manifest versions.
 
 ## License
 

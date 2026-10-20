@@ -176,7 +176,7 @@ dsh plugin --profile zed-dev add -w "link:$PWD"   # 在仓库根目录执行
 
 1. 同时提升 `package.json` 与 `registry/agent.json` 中的 `version`。
 2. 提交后推送 tag：`git tag zed-acp-v<version> && git push origin zed-acp-v<version>`。
-3. workflow `.github/workflows/zed-acp.yml` 会在 tag 上运行三平台测试矩阵，并在配置了 `NPM_TOKEN` 时发布到 npm；它会断言 tag 与两处清单版本一致。
+3. workflow `.github/workflows/zed-acp.yml` 会在 tag 上运行三平台测试矩阵，并通过 Trusted Publishing（OIDC）发布到 npm，仓库中不保存长期 npm token；它会断言 tag 与两处清单版本一致。
 
 ## 许可
 
