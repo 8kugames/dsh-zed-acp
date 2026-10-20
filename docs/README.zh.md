@@ -80,11 +80,11 @@ dsh plugin --profile zed add -w "link:/absolute/path/to/dsh-zed-acp"
 
 ## 分叉、转向与 skills
 
-`session/fork` 以 `sessionCapabilities.fork` 通告。不带扩展块时，它把源会话的整份已提交日志复制进一个新的独立会话，且完全不触碰源会话。带上 `_meta.jetbrains.air.fork`（版本 1，`inclusive`）时，新会话保留选中的那条助手回复及其之前的一切。消息由 `messageId` 指定（`<turn>:<step>`；`<turn>:<step>:segment:<n>` 形式的分片 id 也会匹配到整条消息），可用 `messageFingerprint`（`sha256:` + 助手可见文本的 SHA-256）钉死，用从 1 开始的 `messageOccurrence` 消歧。选中消息上的工具调用会从副本中移除——它们的结果记录在消息之后，只留调用会构成非法转录。分叉点无法解析时回 `invalidParams`，**不会**静默退化成整会话复制。
+`session/fork` 以 `sessionCapabilities.fork` 通告。不带扩展块时，它把源会话的整份已提交日志复制进一个新的独立会话，且完全不触碰源会话。带上 `_meta.jetbrains.air.fork`（版本 1，`inclusive`）时，新会话保留选中的那条助手回复及其之前的一切。消息由 `messageId` 指定（`<turn>:<step>`；`<turn>:<step>:segment:<n>` 形式的分片 id 也会匹配到整条消息；旧版 bridge 使用的持久助手消息 UUID 同样接受），可用 `messageFingerprint`（`sha256:` + 助手可见文本的 SHA-256）钉死，用从 1 开始的 `messageOccurrence` 消歧。选中消息上的工具调用会从副本中移除——它们的结果记录在消息之后，只留调用会构成非法转录。分叉点无法解析或扩展块形状非法时回 `invalidParams`，**不会**静默退化成整会话复制。
 
 分叉子会话是平台 fork 种子（`isSeeded` 加精确继承前缀长度），开放尾部由 `buildForkSeed` 以 `forked` 结果与 step/turn 收尾补齐，因此不会继承半开的回合。fork 血缘设置 `parentSession` 但不设 `origin: 'subagent'`——这正是分支仍是一等根会话的原因：可列出、可重开、可继续对话。分叉继承的是对话而非路由：在非默认模型上分叉会落到组合默认模型，响应里带着子会话的完整 `configOptions` 以便先改后用。
 
-`_session/steering` 是自定义扩展方法，以 `_meta.steering.supported` 通告。它向正在运行的回合追加一条消息，在该回合的下一个步骤边界被消费，回答 `{ outcome: "injected" }` 或 `{ outcome: "promptRequired", reason: "noRunningTurn" }`。bridge 绝不替客户端开启回合：没有请求在等的回合，其 stop reason、费用归属和输出流都没有主人。
+`_session/steering` 是自定义扩展方法，以 `_meta.steering.supported` 通告。它向正在运行的回合追加一条消息，在该回合的下一个步骤边界被消费，回答 `{ outcome: "injected" }`；没有 prompt 或斜杠命令在途时回答 `{ outcome: "promptRequired", reason: "noRunningTurn" }`；仍有 prompt 占着会话的派发槽、但没有可加入的回合（例如回合已结束而结算还在等待后台后代，或正在取消结算），或斜杠命令仍在执行时，回答 `{ outcome: "busy" }`。bridge 绝不替客户端开启回合：没有请求在等的回合，其 stop reason、费用归属和输出流都没有主人。
 
 skills 不需要派发——`/skill-name` 是 harness 自己的调用手势，bridge 补的只是把注册表中 `userInvocable` 的条目列出来。本插件的 bundle 不改动组合：默认 `zed` profile 下 `skill-filesystem` 与 `tool-skill` 仍是禁用的，所以要看到 skill 需要部署方自己挂载 provider。
 

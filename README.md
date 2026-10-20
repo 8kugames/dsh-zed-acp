@@ -104,7 +104,8 @@ into a new independent session and never touches the source. With
 `_meta.jetbrains.air.fork` (version 1, `inclusive`) the new session keeps the
 selected assistant message and everything before it. The message is named by
 `messageId` (`<turn>:<step>`, or a `<turn>:<step>:segment:<n>` segment id that
-resolves to the whole message), optionally pinned with
+resolves to the whole message); the durable assistant-message UUID emitted by
+earlier bridge versions is accepted too, optionally pinned with
 `messageFingerprint` (`sha256:` + the SHA-256 of the assistant's visible text)
 and disambiguated by a 1-based `messageOccurrence`. Tool calls on the selected
 message are stripped from the copy, because their results are logged after it
@@ -123,10 +124,14 @@ the child's full `configOptions` so you can change it first.
 `_session/steering` is a custom extension method advertised as
 `_meta.steering.supported`. It adds one message to a turn that is already
 running, consumed at that turn's next step boundary, and answers
-`{ outcome: "injected" }` or
-`{ outcome: "promptRequired", reason: "noRunningTurn" }`. The bridge never
-starts a turn on the client's behalf: a turn with no waiting request would have
-no owner for its stop reason, cost, or output stream.
+`{ outcome: "injected" }`, or
+`{ outcome: "promptRequired", reason: "noRunningTurn" }` when no prompt or
+command is in flight, or `{ outcome: "busy" }` when an open prompt or running
+slash command still holds the session's dispatch slot (for example while a
+turn has ended but settlement waits on background descendants). The bridge
+never starts a turn on the client's behalf:
+a turn with no waiting request would have no owner for its stop reason, cost,
+or output stream.
 
 Skills need no dispatch — `/skill-name` is the harness's own invocation
 gesture, so the bridge only adds discoverability by listing the registry's

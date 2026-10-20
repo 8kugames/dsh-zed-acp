@@ -98,11 +98,11 @@ When the agent delegates to a continuable subagent (`backgroundMode: continuable
 
 ACP `session/fork` copies an existing session into an independent new one and leaves the source completely untouched. When the client sends `_meta.jetbrains.air.fork` in the request (version 1, `inclusive`), the new session keeps the **selected assistant message and everything before it** and drops everything after it — which is exactly "branch from this reply".
 
-`messageId` is that message's ACP id (`<turn>:<step>`; a streamed segment id `<turn>:<step>:segment:<n>` also resolves to the whole message). If a reused counter makes an id point at a different message, pin it with `messageFingerprint` (`sha256:` plus the SHA-256 of the assistant's visible text); `messageOccurrence` (1-based) disambiguates a repeated fingerprint.
+`messageId` is that message's ACP id (`<turn>:<step>`; a streamed segment id `<turn>:<step>:segment:<n>` also resolves to the whole message). The durable assistant-message UUID emitted by earlier bridge versions is accepted as well. If a reused counter makes an id point at a different message, pin it with `messageFingerprint` (`sha256:` plus the SHA-256 of the assistant's visible text); `messageOccurrence` (1-based) disambiguates a repeated fingerprint.
 
 Tool calls on the selected message are removed from the copied message: their results are recorded after it, so keeping the calls alone would be an illegal transcript and would let the child's `session/load` replay run past the fork point. Earlier calls and results are kept as they were.
 
-A fork point that cannot be found, a fingerprint that disagrees, or an unsupported version all return `invalidParams` — and never silently degrade into a whole-session copy, which would branch from the wrong place with nothing to notice.
+A fork point that cannot be found, a fingerprint that disagrees, a malformed extension block, or an unsupported version all return `invalidParams` — and never silently degrade into a whole-session copy, which would branch from the wrong place with nothing to notice.
 
 A forked child is a platform-native fork seed (`isSeeded` plus the exact inherited prefix length) with its open tail closed by `buildForkSeed`, so it never inherits a half-open turn and it is listable, reopenable, and promptable exactly like any other root session. A fork inherits the conversation, not route state: forking a session pinned to a non-default model lands on the composition default. The fork response carries the child's full `configOptions` so you can change it before prompting.
 
@@ -111,7 +111,8 @@ A forked child is a platform-native fork seed (`isSeeded` plus the exact inherit
 While a `session/prompt` is in flight, a client can send the custom extension method `_session/steering` to add one more message to that same turn — no cancel-and-restart, and no second request. The message is consumed at the turn's next step boundary, and **the request that made the `session/prompt` still owns the turn**: its output stream and stop reason are unchanged.
 
 - `{ "outcome": "injected" }` — the message joined the running turn.
-- `{ "outcome": "promptRequired", "reason": "noRunningTurn" }` — there was no turn to join (no prompt started yet, or the turn already ended). The client sends an ordinary `session/prompt` in that case.
+- `{ "outcome": "promptRequired", "reason": "noRunningTurn" }` — no prompt or slash command is in flight. The client sends an ordinary `session/prompt` in that case.
+- `{ "outcome": "busy" }` — a prompt request is still open but has no steerable turn to join (it may still be in admission, already have ended while settlement waits on background descendants, or be settling after cancellation), or a slash command is still executing. The client must wait: the session's dispatch slot is held until that work settles.
 
 The bridge only calls the agent's injection primitive when a turn is genuinely running; it never starts a turn on the client's behalf, because a turn with no waiting request would have no owner for its stop reason, its cost, or its output stream.
 

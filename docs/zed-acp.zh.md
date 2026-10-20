@@ -98,11 +98,11 @@ agent 面板的模式选择器提供 **Default** 与 **Plan**。计划模式即 
 
 ACP `session/fork` 会把一个已有会话复制成一个独立的新会话，源会话完全不被改动。若客户端在请求的 `_meta` 里带上 `jetbrains.air.fork`（版本 1，`inclusive`），新会话会**保留选中的那条助手回复及其之前的所有内容**，并丢弃它之后的一切——这正是"从这条回复往下另开一条"的语义。
 
-`messageId` 是那条回复的 ACP id（`<turn>:<step>`；流式分片 id `<turn>:<step>:segment:<n>` 也可，匹配到整条消息）。如果客户端重用了计数器导致 id 指向了另一条回复，可以用 `messageFingerprint`（`sha256:` + 助手可见文本的 SHA-256）钉死；`messageOccurrence`（从 1 开始）用于在指纹重复时消歧。
+`messageId` 是那条回复的 ACP id（`<turn>:<step>`；流式分片 id `<turn>:<step>:segment:<n>` 也可，匹配到整条消息；旧版 bridge 使用的持久助手消息 UUID 同样接受）。如果客户端重用了计数器导致 id 指向了另一条回复，可以用 `messageFingerprint`（`sha256:` + 助手可见文本的 SHA-256）钉死；`messageOccurrence`（从 1 开始）用于在指纹重复时消歧。
 
 指向的回复带工具调用时，这些调用会从复制的那条消息里移除：它们的结果记录在消息之后，只留调用会构成非法转录，也会让子会话的 `session/load` 回放越过分叉点。更早的调用与结果原样保留。
 
-找不到分叉点、指纹不符、版本不支持，一律回 `invalidParams`——**不会**悄悄退化成整会话复制，因为那样会让客户端在毫无察觉的情况下从错误的位置分叉。
+找不到分叉点、指纹不符、扩展块形状非法、版本不支持，一律回 `invalidParams`——**不会**悄悄退化成整会话复制，因为那样会让客户端在毫无察觉的情况下从错误的位置分叉。
 
 分叉子会话是平台原生的 fork 血缘（`isSeeded` 加精确的继承前缀长度），经 `buildForkSeed` 补齐开放尾部，所以它不会继承半开的回合，并且与普通根会话一样可列出、可重开、可继续对话。分叉继承的是对话，不是路由状态：在非默认模型上分叉会落到组合默认模型，fork 响应里带着子会话的完整 `configOptions`，可在发 prompt 前改。
 
@@ -111,7 +111,8 @@ ACP `session/fork` 会把一个已有会话复制成一个独立的新会话，�
 `session/prompt` 正在跑时，客户端可以发自定义扩展方法 `_session/steering` 往这一回合里追加一条消息——不需要取消重来，也不会另起一个请求。消息在当前回合的下一个步骤边界被消费，**发起 `session/prompt` 的那个请求仍然持有该回合**：它的输出流和 stop reason 不变。
 
 - `{ "outcome": "injected" }`：消息已进入正在运行的回合。
-- `{ "outcome": "promptRequired", "reason": "noRunningTurn" }`：此刻没有回合可加入（例如尚未发起 prompt，或回合已经结束）。此时由客户端发一条普通的 `session/prompt`。
+- `{ "outcome": "promptRequired", "reason": "noRunningTurn" }`：当前没有 prompt 或斜杠命令在途。此时由客户端发一条普通的 `session/prompt`。
+- `{ "outcome": "busy" }`：仍有 prompt 请求占着会话的派发槽但没有可加入的回合（可能还在准入中、回合已结束而结算在等待后台后代，或正在取消结算），或斜杠命令仍在执行。客户端应等待它结算，不能再发 prompt。
 
 bridge 只在确实有运行中的回合时才调用 agent 的注入原语，绝不替客户端开启一个没有请求在等它的回合——否则那个回合的 stop reason、费用归属和输出流都没有主人。
 
