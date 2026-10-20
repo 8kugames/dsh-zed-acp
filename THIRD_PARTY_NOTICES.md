@@ -1,7 +1,12 @@
 # Third-Party Notices
 
-This package, `@8kugames/dsh-zed-acp`, derives from software developed by
-third parties. Their copyright and license terms are acknowledged below.
+This package, `@8kugames/dsh-zed-acp`, is an independent project and not a
+fork of `deepseek-harness`. It consumes the harness at runtime through its
+published npm packages; the attribution below covers the code derived from
+the upstream repository.
+
+This package derives from software developed by third parties. Their
+copyright and license terms are acknowledged below.
 
 ## Derived work: deepseek-harness
 

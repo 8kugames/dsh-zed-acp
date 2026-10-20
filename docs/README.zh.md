@@ -6,6 +6,10 @@
 
 按 dsh `0.2.1-rc.2` 构建并测试。插件组合在已安装的 harness 之上运行——它不自带运行时，也绝不把你的 key 写进编辑器配置。
 
+## 项目状态
+
+本仓库是一个独立项目，不是 [`deepseek-harness`](https://github.com/deepseek-ai/deepseek-harness) 的 fork。它以插件形式组合在已发布的 harness npm 包之上；上游仓库不配置为本仓库的 git remote，其历史也不并入本仓库。发布与 issue 跟踪都在本仓库进行，问题与功能请求请提交到这里，而不是上游。`DeepSeek Harness` 与 `dsh` 是上游运行时的名称，本项目与 DeepSeek 无从属或背书关系。
+
 ## 安装
 
 前置条件：[dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) 钉到插件对应的版本（`npm i -g @deepseek-ai/dsh@0.2.1-rc.2`——npm 的 `latest` 标签可能落后）、Node `^22.19 || >=24`，以及 Zed。

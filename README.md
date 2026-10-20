@@ -13,6 +13,17 @@ Built and tested against dsh `0.2.1-rc.2`. The plugin composes over the
 installed harness — it ships no runtime of its own and never pins your key in
 editor config.
 
+## Project status
+
+This repository is an independent project, not a fork of
+[`deepseek-harness`](https://github.com/deepseek-ai/deepseek-harness). It is a
+plugin that composes over the harness through its published npm packages; the
+upstream repository is not configured as a git remote and is not merged into
+this history. Releases and the issue tracker live here, so report problems and
+feature requests to this repository rather than upstream. "DeepSeek Harness"
+and "dsh" name the upstream runtime; this project is not endorsed by or
+affiliated with DeepSeek.
+
 ## Install
 
 Prerequisites: [dsh](https://www.npmjs.com/package/@deepseek-ai/dsh) pinned to the version the plugin targets (`npm i -g @deepseek-ai/dsh@0.2.1-rc.2` — the npm `latest` tag may trail it), Node `^22.19 || >=24`, and Zed.

@@ -5,10 +5,23 @@
   "private": false,
   "type": "module",
   "license": "MIT",
+  "author": "8kugames",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/8kugames/dsh-zed-acp.git"
   },
+  "homepage": "https://github.com/8kugames/dsh-zed-acp#readme",
+  "bugs": {
+    "url": "https://github.com/8kugames/dsh-zed-acp/issues"
+  },
+  "keywords": [
+    "zed",
+    "acp",
+    "agent-client-protocol",
+    "dsh",
+    "deepseek-harness",
+    "coding-agent"
+  ],
   "main": "dist/index.js",
   "exports": {
     ".": "./dist/index.js",
