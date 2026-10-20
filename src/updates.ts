@@ -147,12 +147,16 @@ export async function assistantUpdates(
   event: SessionEvent<'assistant/message'>,
 ): Promise<SessionUpdate[]> {
   const updates: SessionUpdate[] = []
+  // The inclusive-fork extension names a message by its ACP id in
+  // `<turn>:<step>` form, so every chunk of one message must carry that id —
+  // the durable message's UUID is not part of the wire contract.
+  const messageId = `${event.data.turn}:${event.data.step}`
   for (const block of event.data.message.content) {
     if (block.type === 'reasoning') {
       if (block.text.length > 0) {
         updates.push({
           sessionUpdate: 'agent_thought_chunk',
-          messageId: event.data.message.id,
+          messageId,
           content: { type: 'text', text: block.text },
         })
       }
@@ -162,7 +166,7 @@ export async function assistantUpdates(
     if (content !== undefined) {
       updates.push({
         sessionUpdate: 'agent_message_chunk',
-        messageId: event.data.message.id,
+        messageId,
         content,
       })
     }

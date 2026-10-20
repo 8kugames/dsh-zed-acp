@@ -119,6 +119,44 @@ describe('session/fork', () => {
     expect((await assistantPoints(forked.sessionId)).map(entry => entry.text)).toEqual(['first answer'])
   })
 
+  it('accepts the durable UUID earlier bridge versions put on the wire', async () => {
+    const sourceId = await seededSession()
+    const message = (await readSessionLog(harness!.ctx, sourceId)).find(event => event.type === 'assistant/message')
+    if (message === undefined || message.type !== 'assistant/message') throw new Error('expected an assistant message')
+    const uuid = message.data.message.id
+    expect(uuid).toMatch(/^[0-9a-f-]{36}$/)
+
+    const forked = await harness!.client.forkSession({
+      sessionId: sourceId,
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: { jetbrains: { air: { fork: { version: 1, messageId: uuid } } } },
+    })
+
+    expect((await assistantPoints(forked.sessionId)).map(entry => entry.text)).toEqual(['first answer'])
+  })
+
+  it('accepts the messageId the client received on its assistant chunks', async () => {
+    const sourceId = await seededSession()
+    const [point] = await assistantPoints(sourceId)
+    // The fork extension names messages by the ACP id on the chunk, so the
+    // wire id and the persisted `<turn>:<step>` lookup key must agree.
+    const visibleIds = harness!.updates
+      .filter(update => update.sessionUpdate === 'agent_message_chunk')
+      .map(update => 'messageId' in update ? update.messageId : undefined)
+      .filter((id): id is string => typeof id === 'string')
+    expect(visibleIds[0]).toBe(point.id)
+
+    const forked = await harness!.client.forkSession({
+      sessionId: sourceId,
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: { jetbrains: { air: { fork: { version: 1, messageId: visibleIds[0]! } } } },
+    })
+
+    expect((await assistantPoints(forked.sessionId)).map(entry => entry.text)).toEqual(['first answer'])
+  })
+
   it('selects by fingerprint when the id no longer matches', async () => {
     const sourceId = await seededSession()
     const [point] = await assistantPoints(sourceId)
@@ -137,6 +175,29 @@ describe('session/fork', () => {
     })
 
     expect((await assistantPoints(forked.sessionId)).map(entry => entry.text)).toEqual(['first answer'])
+  })
+
+  it('rejects an occurrence beyond the fingerprint matches', async () => {
+    const sourceId = await seededSession()
+    const [point] = await assistantPoints(sourceId)
+
+    await expect(harness!.client.forkSession({
+      sessionId: sourceId,
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: {
+        jetbrains: {
+          air: {
+            fork: {
+              version: 1,
+              messageId: '0:9',
+              messageFingerprint: fingerprint(point.text),
+              messageOccurrence: 2,
+            },
+          },
+        },
+      },
+    })).rejects.toThrow(/not found/)
   })
 
   it('rejects a mismatched fingerprint instead of falling back to a whole-session copy', async () => {
@@ -170,6 +231,21 @@ describe('session/fork', () => {
       mcpServers: [],
       _meta: { jetbrains: { air: { fork } } },
     })).rejects.toThrow(expected)
+  })
+
+  it.each([
+    ['a non-object jetbrains block', { jetbrains: 'fork' }],
+    ['a null jetbrains block', { jetbrains: null }],
+    ['a non-object air block', { jetbrains: { air: 'fork' } }],
+    ['a null air block', { jetbrains: { air: null } }],
+  ])('rejects %s instead of copying the whole session', async (_label, meta) => {
+    const sourceId = await seededSession()
+    await expect(harness!.client.forkSession({
+      sessionId: sourceId,
+      cwd: process.cwd(),
+      mcpServers: [],
+      _meta: meta,
+    })).rejects.toThrow(/metadata must be an object/)
   })
 
   it('rejects a fork point the log does not contain', async () => {

@@ -12,6 +12,10 @@
  * The wire contract is byte-identical to openma-ai's `ACP_INCLUSIVE_FORK_CAPABILITY`
  * so the same client works against either adapter.
  *
+ * The message id is the `<turn>:<step>` form the bridge emits. The durable
+ * assistant-message UUID is accepted too, so a client that captured an id from
+ * an earlier bridge version can still fork without reloading the transcript.
+ *
  * A note on what the extension deliberately does *not* do: an unresolvable
  * fork point is `invalidParams`, never a silent whole-session copy. A client
  * that guessed an id wrong and silently received the entire conversation would
@@ -56,6 +60,7 @@ export interface JetbrainsAirForkRequest {
 }
 
 const UNSUPPORTED_VERSION = 'Unsupported jetbrains.air.fork version'
+const META_MALFORMED = 'jetbrains.air.fork metadata must be an object'
 const MESSAGE_ID_REQUIRED = 'jetbrains.air.fork messageId must be a non-empty string'
 const FINGERPRINT_INVALID = 'jetbrains.air.fork messageFingerprint must match sha256:<64 lowercase hex>'
 const OCCURRENCE_INVALID = 'jetbrains.air.fork messageOccurrence must be a positive safe integer'
@@ -80,9 +85,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function parseForkRequest(meta: unknown): JetbrainsAirForkRequest | undefined {
   if (!isRecord(meta)) return undefined
   const jetbrains = meta['jetbrains']
-  if (jetbrains === undefined || !isRecord(jetbrains)) return undefined
+  if (jetbrains === undefined) return undefined
+  // An extension block that is present but not an object is a malformed
+  // request, not an invitation to copy the whole conversation.
+  if (!isRecord(jetbrains)) throw invalid(META_MALFORMED)
   const air = jetbrains['air']
-  if (air === undefined || !isRecord(air) || !Object.hasOwn(air, 'fork')) return undefined
+  if (air === undefined) return undefined
+  if (!isRecord(air)) throw invalid(META_MALFORMED)
+  if (!Object.hasOwn(air, 'fork')) return undefined
   const fork = air['fork']
   if (!isRecord(fork) || fork['version'] !== ACP_INCLUSIVE_FORK_VERSION) {
     throw invalid(UNSUPPORTED_VERSION)
@@ -145,7 +155,7 @@ export function visibleAssistantText(message: unknown): string {
   return texts.join('')
 }
 
-/** The `<turn>:<step>` ACP id clients receive as a chunk's `messageId`. */
+/** The `<turn>:<step>` ACP id current clients receive as a chunk's `messageId`. */
 function assistantMessageId(data: unknown): string | undefined {
   if (!isRecord(data)) return undefined
   const { turn, step } = data
@@ -159,7 +169,10 @@ function assistantMessageId(data: unknown): string | undefined {
 interface AssistantHit {
   /** The message's own event seq — the inclusive fork boundary. */
   readonly seq: SessionSeq
-  readonly messageId: string
+  /** The `<turn>:<step>` wire id, when the event carries both coordinates. */
+  readonly messageId: string | undefined
+  /** The durable message UUID earlier bridge versions put on the wire. */
+  readonly messageUuid: string | undefined
   readonly fingerprint: string
 }
 
@@ -169,10 +182,14 @@ function assistantHits(events: readonly SessionEvent[]): AssistantHit[] {
   for (const event of events) {
     if (event.type !== 'assistant/message') continue
     const messageId = assistantMessageId(event.data)
-    if (messageId === undefined) continue
+    const messageUuid = typeof event.data.message.id === 'string' && event.data.message.id.length > 0
+      ? event.data.message.id
+      : undefined
+    if (messageId === undefined && messageUuid === undefined) continue
     hits.push({
       seq: event.seq,
       messageId,
+      messageUuid,
       fingerprint: assistantMessageFingerprint(visibleAssistantText(event.data.message)),
     })
   }
@@ -208,7 +225,7 @@ export function locateForkBoundary(
 ): SessionSeq {
   const hits = assistantHits(events)
   for (const candidate of candidateIds(request.messageId)) {
-    const found = hits.find(hit => hit.messageId === candidate)
+    const found = hits.find(hit => hit.messageId === candidate || hit.messageUuid === candidate)
     if (found !== undefined && (request.messageFingerprint === undefined || found.fingerprint === request.messageFingerprint)) {
       return found.seq
     }
@@ -216,7 +233,7 @@ export function locateForkBoundary(
 
   if (request.messageFingerprint !== undefined) {
     const matches = hits.filter(hit => hit.fingerprint === request.messageFingerprint)
-    const chosen = matches.length === 1 ? matches[0] : matches[request.messageOccurrence - 1]
+    const chosen = matches[request.messageOccurrence - 1]
     if (chosen !== undefined) return chosen.seq
   }
 
