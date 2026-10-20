@@ -30,13 +30,13 @@ import {
 } from '@deepseek-ai/dsh-session'
 import { buildForkSeed } from '@deepseek-ai/dsh-session/fork'
 import { AcpContentError, admitAcpPrompt } from './content.ts'
-import { acpCommandLine, commandResultUpdate } from './commands.ts'
+import { acpCommandLine, commandResultUpdate, commandTextUpdate } from './commands.ts'
 import { turnEndToStopReason } from './codec.ts'
 import { acpConfigOptions } from './config-options.ts'
 import { inclusiveHistoryPrefix, locateForkBoundary, type JetbrainsAirForkRequest } from './fork.ts'
 import { mountAcpMcpServers } from './mcp.ts'
 import type { SkillCatalog } from './skills.ts'
-import { steeringInjected, steeringPromptRequired, type AcpSteeringOutcome } from './steering.ts'
+import { steeringBusy, steeringInjected, steeringPromptRequired, type AcpSteeringOutcome } from './steering.ts'
 import { AcpModelControl, type ReasoningPreferenceStore } from './model-control.ts'
 import { AcpPermissionControl, PERMISSION_CONFIG_ID } from './permission-control.ts'
 import { AcpPresetControl, PRESET_CONFIG_ID } from './preset-control.ts'
@@ -183,6 +183,14 @@ interface DescendantFacts {
   summary: string | undefined
 }
 
+/** One slash-command execution currently holding the session's command slot. */
+interface InflightCommand {
+  /** Withdraw the execution; the handler observes an aborted signal. */
+  abort: (detail: string) => void
+  /** Settles once the handler and its result delivery are finished. */
+  done: Promise<void>
+}
+
 interface InflightPrompt {
   resolve: (reason: StopReason) => void
   reject: (error: Error) => void
@@ -323,6 +331,8 @@ export class AcpSession {
    * handler against a host domain.
    */
   private commandRunning = false
+  /** The command execution close/cancel can abort and await. */
+  private command: InflightCommand | undefined
   private closing: Promise<void> | undefined
   private readonly pendingSelections = new Map<string, ModelSelection>()
   private statsCollector: TurnStatsCollector | undefined
@@ -714,6 +724,8 @@ export class AcpSession {
    * Nothing about the turn path is borrowed: no prompt slot is taken, no
    * admission runs, no turn starts, so there is no stop reason to reconcile
    * and no stats to settle. The handler's own text is the whole deliverable.
+   * The execution is tracked separately from `inflight` so `session/cancel`
+   * and `close` can abort it and wait for the handler before teardown.
    * @param params - standard ACP prompt request for this session.
    * @param signal - JSON-RPC request cancellation signal.
    * @returns the stop reason to answer with, or `undefined` when the prompt is
@@ -727,13 +739,27 @@ export class AcpSession {
     if (commands === undefined) return undefined
     const line = acpCommandLine(params.prompt)
     if (line === undefined) return undefined
+    this.assertActive()
+    if (this.ctx.agents.get(this.agent.id) !== this.agent) {
+      throw internalError('prompt was not queued: the agent was disposed outside the bridge')
+    }
+    const controller = new AbortController()
+    const commandSignal = AbortSignal.any([signal, controller.signal])
+    let finish!: () => void
+    const done = new Promise<void>((resolve) => { finish = resolve })
+    this.command = { abort: (detail) => { controller.abort(new Error(detail)) }, done }
     this.commandRunning = true
     try {
-      if (signal.aborted) return 'cancelled'
+      if (commandSignal.aborted) return 'cancelled'
       // An unresolved name is not a command this bridge swallowed: the registry
       // declines it and the line stays prose, exactly as it does today.
-      const execution = await commands.execute(this.agent, line, [], signal)
+      const execution = await commands.execute(this.agent, line, [], commandSignal)
+      if (commandSignal.aborted) return 'cancelled'
+      if (this.closing !== undefined) return 'cancelled'
       if (execution === undefined) return undefined
+      if (this.ctx.agents.get(this.agent.id) !== this.agent) {
+        throw internalError('prompt was not queued: the agent was disposed outside the bridge')
+      }
       const update = commandResultUpdate(execution)
       if (update !== undefined) {
         const previous = this.outputTail
@@ -748,6 +774,8 @@ export class AcpSession {
       }
       return 'end_turn'
     } catch (error: unknown) {
+      if (commandSignal.aborted) return 'cancelled'
+      if (error instanceof RequestError) throw error
       // A handler that already appended `command/run` owns domain state by the
       // time it throws, so falling through to the model would run the command's
       // intent a second time. Report the failure and end the turn instead.
@@ -764,9 +792,11 @@ export class AcpSession {
         this.ctx.logger.warn(`acp: slash-command failure delivery failed: ${errorChain(notifyError)}`)
       })
       await this.outputTail
-      return signal.aborted ? 'cancelled' : 'end_turn'
+      return 'end_turn'
     } finally {
       this.commandRunning = false
+      if (this.command?.done === done) this.command = undefined
+      finish()
     }
   }
 
@@ -789,6 +819,9 @@ export class AcpSession {
     // prompt slot below. Prose falls through untouched.
     const command = await this.dispatchCommand(params, requestSignal ?? new AbortController().signal)
     if (command !== undefined) return { stopReason: command }
+    // A close that started while the command registry declined the line must
+    // not let the prose path queue work into a closing session.
+    this.assertActive()
     const completion = Promise.withResolvers<StopReason>()
     const admission = Promise.withResolvers<void>()
     const admissionController = new AbortController()
@@ -892,7 +925,9 @@ export class AcpSession {
    * @param prompt - ACP content blocks to inject.
    * @param imageEnabled - connection capability advertised at initialization.
    * @param signal - JSON-RPC request cancellation signal.
-   * @returns `injected`, or `promptRequired` when no turn is running.
+   * @returns `injected`; `promptRequired` when no prompt or command holds the
+   *   slot; `busy` when an open prompt has no steerable turn or a slash command
+   *   is still executing.
    */
   async steer(
     prompt: readonly ContentBlock[],
@@ -901,7 +936,9 @@ export class AcpSession {
   ): Promise<AcpSteeringOutcome> {
     this.assertActive()
     const aimed = this.inflight
-    if (!this.steerable()) return steeringPromptRequired()
+    if (!this.steerable()) {
+      return aimed === undefined && !this.commandRunning ? steeringPromptRequired() : steeringBusy()
+    }
     // Admission reads the route this turn was pinned to, not the session's live
     // selection: a model option change mid-turn rewrites `selected` while the
     // running turn keeps the route it started on, and a steered block must be
@@ -912,7 +949,9 @@ export class AcpSession {
     // claimed a new one — while it ran. `aimed` pins *which* turn: `steerable()`
     // alone asks whether some turn is live, which would let a block admitted on
     // one turn's route inject into another turn's queue.
-    if (this.inflight !== aimed || !this.steerable()) return steeringPromptRequired()
+    if (this.inflight !== aimed || !this.steerable()) {
+      return this.inflight === undefined && !this.commandRunning ? steeringPromptRequired() : steeringBusy()
+    }
     this.agent.steer(createUserMessage({ content, source: { kind: 'user' } }))
     return steeringInjected()
   }
@@ -945,11 +984,24 @@ export class AcpSession {
     return this.agent.status === 'running'
   }
 
-  /** Cancel the active prompt, or autonomous work when no ACP prompt exists. */
+  /** Cancel the active prompt or command, or autonomous work when neither exists. */
   cancel(): void {
-    const inflight = this.inflight
-    this.cancelPrompt('ACP prompt cancelled')
-    if (inflight === undefined) this.agent.cancel({ kind: 'user' })
+    let cancelled = false
+    if (this.inflight !== undefined) {
+      this.cancelPrompt('ACP prompt cancelled')
+      cancelled = true
+    }
+    if (this.command !== undefined) {
+      this.command.abort('ACP prompt cancelled')
+      cancelled = true
+    }
+    if (!cancelled) {
+      try {
+        this.agent.cancel({ kind: 'user' })
+      } catch (error: unknown) {
+        this.ctx.logger.warn(`acp: agent cancellation failed: ${errorChain(error)}`)
+      }
+    }
   }
 
   /**
@@ -1107,6 +1159,23 @@ export class AcpSession {
         }).catch((error: unknown) => {
           this.ctx.logger.warn(`acp: user-message replay delivery failed: ${errorChain(error)}`)
         })
+        continue
+      }
+      if (event.type === 'command/done') {
+        // A command's result is not an assistant/message in the log; its
+        // durable lifecycle record is the only copy the reload can replay.
+        const text = event.data.text
+        if (typeof text === 'string') {
+          const update = commandTextUpdate(event.data.commandId, text)
+          const previous = this.outputTail
+          this.outputTail = previous
+            .then(() => this.notify({ sessionId, update }))
+            /* v8 ignore start -- the bridge notifier contains transport failure. */
+            .catch((error: unknown) => {
+              this.ctx.logger.warn(`acp: command-result replay delivery failed: ${errorChain(error)}`)
+            })
+          /* v8 ignore stop */
+        }
         continue
       }
       this.onSessionEvent(this.agent.session, event)
@@ -1477,11 +1546,31 @@ export class AcpSession {
     this.closing = (async () => {
       const failures: unknown[] = []
       const inflight = this.inflight
-      this.cancelPrompt(detail)
-      if (inflight === undefined || !inflight.messageQueued) this.agent.cancel({ kind: 'user' })
+      const command = this.command
+      // Cancellation is best-effort: a disposed agent cannot read inbox state,
+      // and that must not skip the drain/flush/dispose below.
+      try {
+        this.cancelPrompt(detail)
+      } catch (error: unknown) {
+        this.ctx.logger.warn(`acp: prompt cancellation failed: ${errorChain(error)}`)
+      }
+      try {
+        command?.abort(detail)
+      } catch (error: unknown) {
+        this.ctx.logger.warn(`acp: command cancellation failed: ${errorChain(error)}`)
+      }
+      const agentOwned = (): boolean => this.ctx.agents.get(this.agent.id) === this.agent
+      if (command === undefined && agentOwned() && (inflight === undefined || !inflight.messageQueued)) {
+        try {
+          this.agent.cancel({ kind: 'user' })
+        } catch (error: unknown) {
+          this.ctx.logger.warn(`acp: agent cancellation failed: ${errorChain(error)}`)
+        }
+      }
       try {
         await inflight?.admissionDone
-        await this.agent.whenIdle()
+        await command?.done
+        if (agentOwned()) await this.agent.whenIdle()
         await this.outputTail
       } catch (error: unknown) {
         failures.push(new Error('ACP session activity drain failed', { cause: error }))
@@ -1505,15 +1594,20 @@ export class AcpSession {
       this.orphanedDescendants.clear()
       this.stopDescendantTimer()
       this.releaseDescendantWaiters()
-      try {
-        await this.ctx.sessions.flush(this.agent.session)
-      } catch (error: unknown) {
-        failures.push(new Error('ACP session persistence flush failed', { cause: error }))
-      }
-      try {
-        await this.disposeAgent()
-      } catch (error: unknown) {
-        failures.push(error)
+      // A host that disposed the agent outside the bridge already drained its
+      // session; flushing or disposing it again only fails against a dead
+      // store, so these steps are for a still-owned agent only.
+      if (agentOwned()) {
+        try {
+          await this.ctx.sessions.flush(this.agent.session)
+        } catch (error: unknown) {
+          failures.push(new Error('ACP session persistence flush failed', { cause: error }))
+        }
+        try {
+          await this.disposeAgent()
+        } catch (error: unknown) {
+          failures.push(error)
+        }
       }
       this.pendingSelections.clear()
       this.projectedCalls.clear()
@@ -1767,6 +1861,10 @@ export class AcpSession {
     if (inflight === undefined) return
     inflight.cancelRequested = true
     inflight.admissionController.abort(new Error(detail))
+    // An unclaimed message's route pin and an unanswered tool call's
+    // presentation belong to this request; neither may outlive its cancellation.
+    this.pendingSelections.clear()
+    this.projectedCalls.clear()
     // Whatever is still active when the request dies is treated as its leftover
     // — a snapshot is the only signal available here, and it errs toward
     // waiting less. Marking it orphaned is what keeps this prompt's own
@@ -1778,7 +1876,13 @@ export class AcpSession {
     }
     this.releaseDescendantWaiters()
     this.settleAfterQuiescence(inflight)
-    if (inflight.messageQueued) this.agent.cancel({ kind: 'user' })
+    if (inflight.messageQueued) {
+      try {
+        this.agent.cancel({ kind: 'user' })
+      } catch (error: unknown) {
+        this.ctx.logger.warn(`acp: agent cancellation failed: ${errorChain(error)}`)
+      }
+    }
   }
 
   private settleAfterQuiescence(inflight: InflightPrompt): void {
@@ -1826,6 +1930,8 @@ export class AcpSession {
       if (this.inflight !== inflight) return
       await this.emitTurnStats(inflight)
       this.inflight = undefined
+      this.pendingSelections.clear()
+      this.projectedCalls.clear()
       if (inflight.cancelRequested) {
         inflight.resolve('cancelled')
         return
@@ -1851,6 +1957,8 @@ export class AcpSession {
       .catch((error: unknown) => {
         if (this.inflight !== inflight) return
         this.inflight = undefined
+        this.pendingSelections.clear()
+        this.projectedCalls.clear()
         inflight.reject(internalError(`prompt settlement failed: ${errorChain(error)}`))
       })
     /* v8 ignore stop */

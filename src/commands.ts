@@ -55,25 +55,34 @@ export function acpCommandLine(prompt: readonly ContentBlock[]): string | undefi
 }
 
 /**
- * Project one settled command result as the assistant text the client shows.
+ * Build the assistant text chunk for one settled command outcome.
  *
  * The handler's text is already a complete, user-facing sentence, so it is
- * carried verbatim. A success with no text produces no chunk: the registry
- * models "said nothing" as a real outcome, and inventing a placeholder would
- * put a line in the client's transcript that no handler wrote.
- *
- * The execution's pairing id becomes the chunk's `messageId`, so a client
+ * carried verbatim. The pairing id becomes the chunk's `messageId`, so a client
  * groups the whole result under one message and can correlate it with the
  * `command/run` / `command/done` records the registry appended to the log.
+ * @param commandId - the settled execution's pairing id.
+ * @param text - the handler's verbatim result text.
+ * @returns the assistant text chunk.
+ */
+export function commandTextUpdate(commandId: string, text: string): SessionUpdate {
+  return {
+    sessionUpdate: 'agent_message_chunk',
+    messageId: commandId,
+    content: { type: 'text', text },
+  }
+}
+
+/**
+ * Project one settled command result as the assistant text the client shows.
+ *
+ * A success with no text produces no chunk: the registry models "said nothing"
+ * as a real outcome, and inventing a placeholder would put a line in the
+ * client's transcript that no handler wrote.
  * @param execution - one settled command execution.
  * @returns the update, or `undefined` when the result carries no text.
  */
 export function commandResultUpdate(execution: CommandExecution): SessionUpdate | undefined {
   const text = execution.result.text
-  if (text === undefined) return undefined
-  return {
-    sessionUpdate: 'agent_message_chunk',
-    messageId: execution.commandId,
-    content: { type: 'text', text },
-  }
+  return text === undefined ? undefined : commandTextUpdate(execution.commandId, text)
 }

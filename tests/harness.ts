@@ -15,6 +15,8 @@ import {
   type CreateElicitationResponse,
   type ForkSessionRequest,
   type ForkSessionResponse,
+  type NewSessionRequest,
+  type NewSessionResponse,
   type PromptRequest,
   type PromptResponse,
   type RequestPermissionRequest,
@@ -420,7 +422,7 @@ export type CapturedUpdate = SessionNotification['update']
 interface BridgeClient {
   initialize: NonNullable<AcpAgent['initialize']>
   authenticate: NonNullable<AcpAgent['authenticate']>
-  newSession: NonNullable<AcpAgent['newSession']>
+  newSession: (params: NewSessionRequest, options?: SendRequestOptions) => Promise<NewSessionResponse>
   listSessions: NonNullable<AcpAgent['listSessions']>
   loadSession: NonNullable<AcpAgent['loadSession']>
   resumeSession: NonNullable<AcpAgent['resumeSession']>
@@ -450,9 +452,10 @@ export interface BridgeHarness {
   /** The mounted stub command registry; undefined unless the option mounted one. */
   commands: StubCommandRegistry | undefined
   permissionRequests: RequestPermissionRequest[]
+  permissionRequestSignals: AbortSignal[]
   elicitationRequests: CreateElicitationRequest[]
   persistenceRoot: string
-  onPermission: (request: RequestPermissionRequest) => RequestPermissionResponse
+  onPermission: (request: RequestPermissionRequest) => RequestPermissionResponse | Promise<RequestPermissionResponse>
   onElicitation: (request: CreateElicitationRequest) => CreateElicitationResponse
   onSessionUpdateError: (() => void) | undefined
   registerCatalogProvider: (provider: string) => () => void
@@ -559,6 +562,7 @@ export async function makeBridgeHarness(options: {
   const updates: CapturedUpdate[] = []
   const sessionUpdates: { sessionId: string; update: CapturedUpdate }[] = []
   const permissionRequests: RequestPermissionRequest[] = []
+  const permissionRequestSignals: AbortSignal[] = []
   const elicitationRequests: CreateElicitationRequest[] = []
   const harness: BridgeHarness = {
     ctx,
@@ -567,6 +571,7 @@ export async function makeBridgeHarness(options: {
     updates,
     sessionUpdates,
     permissionRequests,
+    permissionRequestSignals,
     elicitationRequests,
     presets: stubPresets,
     permissions: stubPermissions,
@@ -596,8 +601,9 @@ export async function makeBridgeHarness(options: {
       if (harness.onSessionUpdateError !== undefined) return Promise.reject(new Error('client update rejected'))
       return Promise.resolve()
     })
-    .onRequest(methods.client.session.requestPermission, ({ params }) => {
+    .onRequest(methods.client.session.requestPermission, ({ params, signal }) => {
       permissionRequests.push(params)
+      permissionRequestSignals.push(signal)
       return Promise.resolve(harness.onPermission(params))
     })
     .onRequest(methods.client.elicitation.create, ({ params }) => {
@@ -625,7 +631,7 @@ export async function makeBridgeHarness(options: {
   harness.client = {
     initialize: params => client.request(methods.agent.initialize, params),
     authenticate: params => client.request(methods.agent.authenticate, params),
-    newSession: params => client.request(methods.agent.session.new, params),
+    newSession: (params, options) => client.request(methods.agent.session.new, params, options),
     listSessions: params => client.request(methods.agent.session.list, params),
     loadSession: params => client.request(methods.agent.session.load, params),
     resumeSession: params => client.request(methods.agent.session.resume, params),

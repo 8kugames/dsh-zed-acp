@@ -263,6 +263,61 @@ describe('automation-only ACP bridge', () => {
     expect(harness.ctx.agents.get(SessionId(created.sessionId))).toBeUndefined()
   })
 
+  it('still flushes and disposes when cancellation throws', async () => {
+    harness = await makeBridgeHarness()
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const agent = harness.ctx.agents.get(SessionId(created.sessionId))!
+    vi.spyOn(agent, 'cancel').mockImplementationOnce(() => { throw new Error('cancel exploded') })
+    const flush = vi.spyOn(harness.ctx.sessions, 'flush')
+
+    await expect(harness.client.closeSession({ sessionId: created.sessionId })).resolves.toEqual({})
+    expect(flush).toHaveBeenCalled()
+    expect(harness.ctx.agents.get(SessionId(created.sessionId))).toBeUndefined()
+  })
+
+  it('closes a session whose agent was disposed outside the bridge', async () => {
+    harness = await makeBridgeHarness()
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const created = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    await harness.loopFiber.dispose()
+
+    await expect(harness.client.closeSession({ sessionId: created.sessionId })).resolves.toEqual({})
+  })
+
+  it('does not publish a session whose creation request was cancelled', async () => {
+    harness = await makeBridgeHarness()
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const started = Promise.withResolvers<void>()
+    const gate = Promise.withResolvers<void>()
+    vi.spyOn(harness.ctx.sessions, 'flush').mockImplementationOnce(async () => {
+      started.resolve()
+      await gate.promise
+      return true
+    })
+    let sessionSignal: AbortSignal | undefined
+    const create = harness.ctx.agents.create.bind(harness.ctx.agents)
+    vi.spyOn(harness.ctx.agents, 'create').mockImplementation(async (options) => {
+      sessionSignal = options.signal
+      return create(options)
+    })
+    const controller = new AbortController()
+    const pending = harness.client.newSession(
+      { cwd: process.cwd(), mcpServers: [] },
+      { cancellationSignal: controller.signal },
+    )
+    await started.promise
+    expect(harness.ctx.sessions.list()).toHaveLength(1)
+
+    controller.abort(new Error('client cancelled session/new'))
+    // Wait until the protocol-level cancel reaches the agent's request signal,
+    // then release the gated activation.
+    await vi.waitFor(() => { expect(sessionSignal?.aborted).toBe(true) })
+    gate.resolve()
+    await expect(pending).rejects.toThrow()
+    await vi.waitFor(() => { expect(harness!.ctx.sessions.list()).toHaveLength(0) })
+  })
+
   it('resumes a closed persisted session without replaying its history', async () => {
     harness = await makeBridgeHarness({ script: [textResponse('first answer'), textResponse('second answer')] })
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })

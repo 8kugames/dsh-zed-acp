@@ -534,6 +534,33 @@ describe('continuable-descendant visibility', () => {
     expect(statsCard !== undefined && 'title' in statsCard ? statsCard.title : '').toMatch(/↑ 10 · ↓ 28/)
   })
 
+  it('answers busy while the prompt is gated on a continuable descendant', async () => {
+    harness = await makeBridgeHarness({ script: [textResponse('parent done'), textResponse('after descendants')] })
+    await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
+    const { sessionId } = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
+    const prompt = harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'go' }] })
+    const child = fakeDescendant(sessionId)
+    await harness.ctx.emit('agent/created', { agent: child, source: 'startup' })
+    await harness.ctx.emit('agent/status', { agent: child, status: 'running' })
+    await vi.waitFor(() => {
+      expect(harness!.updates.some(update => update.sessionUpdate === 'agent_message_chunk')).toBe(true)
+    })
+    await new Promise(resolve => setImmediate(resolve))
+
+    // The parent turn ended, but the prompt is still open and waits on the
+    // child. Steering must not tell the client to send a new prompt: the
+    // session's prompt slot is held until the original request settles.
+    await expect(harness.client.steer({
+      sessionId,
+      prompt: [{ type: 'text', text: 'follow-up' }],
+    })).resolves.toEqual({ outcome: 'busy' })
+    await expect(harness.client.prompt({ sessionId, prompt: [{ type: 'text', text: 'follow-up' }] }))
+      .rejects.toThrow(/already in flight/)
+
+    await harness.ctx.emit('agent/status', { agent: child, status: 'idle' })
+    await expect(prompt).resolves.toEqual({ stopReason: 'end_turn' })
+  })
+
   it('settles promptly on cancel while the descendant keeps running', async () => {
     harness = await makeBridgeHarness({ script: [textResponse('working')] })
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })

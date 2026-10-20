@@ -321,7 +321,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
           { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
         ],
       }
-      return conn.request(methods.client.session.requestPermission, params)
+      // The asker's signal is the turn's cancellation channel: passing it as
+      // the request's cancellation signal withdraws the client dialog instead
+      // of leaving it pending after the turn was cancelled or the session closed.
+      return conn.request(methods.client.session.requestPermission, params,
+        request.signal === undefined ? undefined : { cancellationSignal: request.signal })
     }).then(({ outcome }) => {
       if (outcome.outcome === 'cancelled') return 'cancelled'
       return outcome.optionId === 'allow-once' ? 'allowed-once' : 'rejected'
@@ -407,9 +411,13 @@ export function apply(ctx: Context, config: AcpConfig): void {
       try {
         const configOptions = await record.configOptions(signal)
         const modes = record.modesState()
+        signal.throwIfAborted()
         assertOpen()
         // The attached log writer's flush materializes an empty session durably.
         await ctx.sessions.flush(record.agent.session)
+        // A request cancelled after its response was already in reach must not
+        // publish a session the client never learned the id of.
+        signal.throwIfAborted()
         assertOpen()
         // Deferred to a macrotask so the session/new response is queued onto
         // the stdio stream first; a strict client that drops updates for
@@ -420,7 +428,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
         return { sessionId, ...(modes === undefined ? {} : { modes }), configOptions }
       } catch (error: unknown) {
         sessions.delete(sessionId)
-        await record.close('session/new activation failed')
+        try {
+          await record.close('session/new activation failed')
+        } catch (closeError: unknown) {
+          logger.warn(`acp: session/new rollback failed: ${String(closeError)}`)
+        }
         throw error
       }
     },
@@ -474,6 +486,8 @@ export function apply(ctx: Context, config: AcpConfig): void {
         try {
           const configOptions = await record.configOptions(signal)
           const modes = record.modesState()
+          signal.throwIfAborted()
+          assertOpen()
           // Same response-first deferral as session/new: the roster follows the
           // session/resume response onto the wire.
           setImmediate(() => {
@@ -482,7 +496,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
           return { ...(modes === undefined ? {} : { modes }), configOptions }
         } catch (error: unknown) {
           sessions.delete(sessionId)
-          await record.close('session/resume option discovery failed')
+          try {
+            await record.close('session/resume option discovery failed')
+          } catch (closeError: unknown) {
+            logger.warn(`acp: session/resume rollback failed: ${String(closeError)}`)
+          }
           throw error
         }
       })().finally(() => { activating.delete(sessionId) })
@@ -532,6 +550,7 @@ export function apply(ctx: Context, config: AcpConfig): void {
           // The full history rides session/update notifications ahead of this
           // handler's response, the order the ACP spec's loading path requires.
           await record.replayStoredHistory(signal)
+          signal.throwIfAborted()
           /* v8 ignore next 4 -- a real stdio close can race an in-flight load. */
           if (closed) {
             await record.close('connection closed during session/load')
@@ -540,6 +559,8 @@ export function apply(ctx: Context, config: AcpConfig): void {
           sessions.set(sessionId, record)
           const configOptions = await record.configOptions(signal)
           const modes = record.modesState()
+          signal.throwIfAborted()
+          assertOpen()
           // Same response-first deferral as session/new: the roster follows the
           // session/load response onto the wire.
           setImmediate(() => {
@@ -548,7 +569,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
           return { ...(modes === undefined ? {} : { modes }), configOptions }
         } catch (error: unknown) {
           sessions.delete(sessionId)
-          await record.close('session/load activation failed')
+          try {
+            await record.close('session/load activation failed')
+          } catch (closeError: unknown) {
+            logger.warn(`acp: session/load rollback failed: ${String(closeError)}`)
+          }
           throw error
         }
       })().finally(() => { activating.delete(sessionId) })
@@ -599,11 +624,13 @@ export function apply(ctx: Context, config: AcpConfig): void {
       try {
         const configOptions = await record.configOptions(signal)
         const modes = record.modesState()
+        signal.throwIfAborted()
         assertOpen()
         // The child is a seeded session: the factory's own creation is its first
         // durable write, and the same flush that materializes an empty
         // `session/new` materializes the inherited prefix.
         await ctx.sessions.flush(record.agent.session)
+        signal.throwIfAborted()
         assertOpen()
         setImmediate(() => {
           if (sessions.get(sessionId) === record) record.publishAvailableCommands()
@@ -615,7 +642,11 @@ export function apply(ctx: Context, config: AcpConfig): void {
         }
       } catch (error: unknown) {
         sessions.delete(sessionId)
-        await record.close('session/fork activation failed')
+        try {
+          await record.close('session/fork activation failed')
+        } catch (closeError: unknown) {
+          logger.warn(`acp: session/fork rollback failed: ${String(closeError)}`)
+        }
         throw error
       }
     },

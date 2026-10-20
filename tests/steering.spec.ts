@@ -242,11 +242,12 @@ describe('_session/steering', () => {
     await prompt
   })
 
-  it('answers promptRequired when the turn is cancelled while image admission is in flight', async () => {
+  it('answers busy when the turn is cancelled while image admission is in flight', async () => {
     // The second steerable() re-check exists for exactly this window: the
     // turn the message aimed at must stay live through admission, which for
     // an image awaits attachment storage. Cancelling behind that await must
-    // land on promptRequired, never on a steered message with no owning turn.
+    // not inject into a turn with no owner; the cancelled prompt still holds
+    // the slot while it settles, so the honest answer is busy.
     harness = await makeBridgeHarness({ imageCapable: true, script: ['hang'] })
     await harness.client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
     const session = await harness.client.newSession({ cwd: process.cwd(), mcpServers: [] })
@@ -272,7 +273,7 @@ describe('_session/steering', () => {
 
     await harness.client.cancel({ sessionId: session.sessionId })
     release()
-    await expect(steered).resolves.toEqual({ outcome: 'promptRequired', reason: 'noRunningTurn' })
+    await expect(steered).resolves.toEqual({ outcome: 'busy' })
     saveImages.mockRestore()
 
     await expect(prompt).resolves.toEqual({ stopReason: 'cancelled' })
@@ -311,7 +312,7 @@ describe('_session/steering', () => {
     await prompt
   })
 
-  it('answers promptRequired when admission spans a turn handover', async () => {
+  it('answers busy when admission spans a turn handover', async () => {
     // Image admission awaits attachment storage, and that await spans whole
     // turn handovers: T1 can settle and a later prompt can claim T2 while the
     // message is still being admitted. The block was admitted on T1's pinned
@@ -364,7 +365,9 @@ describe('_session/steering', () => {
     await vi.waitFor(() => { expect(harness!.adapter.requests.length).toBe(2) })
 
     release()
-    await expect(steered).resolves.toEqual({ outcome: 'promptRequired', reason: 'noRunningTurn' })
+    // A different prompt owns the slot now, so telling the client to send yet
+    // another prompt would collide with the concurrency guard.
+    await expect(steered).resolves.toEqual({ outcome: 'busy' })
     saveImages.mockRestore()
 
     await harness.client.cancel({ sessionId: session.sessionId })
@@ -389,10 +392,12 @@ describe('_session/steering', () => {
     if (agent === undefined) throw new Error('expected the session agent')
     Object.defineProperty(agent, 'status', { value: 'idle', configurable: true, writable: true })
 
+    // The prompt is still in flight and holds the slot; the client must wait
+    // rather than send a second prompt the concurrency guard would reject.
     await expect(harness.client.steer({
       sessionId: session.sessionId,
       prompt: [{ type: 'text', text: 'after the driver retired' }],
-    } as never)).resolves.toEqual({ outcome: 'promptRequired', reason: 'noRunningTurn' })
+    } as never)).resolves.toEqual({ outcome: 'busy' })
 
     await harness.client.cancel({ sessionId: session.sessionId })
     await prompt

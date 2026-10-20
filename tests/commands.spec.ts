@@ -4,8 +4,9 @@
  * gate or a rate-limited model route.
  */
 
-import { describe, it, expect, afterEach } from 'vitest'
-import type { SessionEvent } from '@deepseek-ai/dsh-session'
+import { describe, it, expect, afterEach, vi } from 'vitest'
+import { CommandId } from '@deepseek-ai/dsh-commands'
+import { SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import { makeBridgeHarness, readSessionLog, textResponse, type BridgeHarness } from './harness.ts'
 import type { ScriptedResponse } from './harness.ts'
 
@@ -134,5 +135,127 @@ describe('slash commands over session/prompt', () => {
       .rejects.toThrow(/already in flight/)
     release!()
     await expect(first).resolves.toEqual({ stopReason: 'end_turn' })
+  })
+
+  it('aborts a running command on session/cancel and settles the prompt as cancelled', async () => {
+    const built = await withGoalCommand()
+    const { sessionId } = await built.client.newSession({ cwd: built.persistenceRoot, mcpServers: [] })
+    let release: (() => void) | undefined
+    let entered: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const started = new Promise<void>((resolve) => { entered = resolve })
+    const executing = built.commands!.execute
+    let signal: AbortSignal | undefined
+    built.commands!.execute = async (...args) => {
+      signal = args[3]
+      entered!()
+      await gate
+      return executing.call(built.commands!, ...args)
+    }
+
+    const prompt = built.client.prompt({ sessionId, prompt: [{ type: 'text', text: '/goal pause' }] })
+    await started
+    await built.client.cancel({ sessionId })
+    await vi.waitFor(() => { expect(signal?.aborted).toBe(true) })
+    release!()
+
+    await expect(prompt).resolves.toEqual({ stopReason: 'cancelled' })
+    expect(deliveredAgentText(built)).not.toContain('Goal paused')
+  })
+
+  it("replays a settled command's text on session/load", async () => {
+    const built = await withGoalCommand()
+    const { sessionId } = await built.client.newSession({ cwd: built.persistenceRoot, mcpServers: [] })
+    const agent = built.ctx.agents.get(SessionId(sessionId))!
+    agent.session.append('command/run', {
+      commandId: CommandId('cmd-replay'),
+      name: 'goal',
+      source: { kind: 'user' },
+    })
+    agent.session.append('command/done', {
+      commandId: CommandId('cmd-replay'),
+      kind: 'success',
+      text: 'Goal paused',
+    })
+    await built.client.closeSession({ sessionId })
+    const before = built.sessionUpdates.length
+
+    await built.client.loadSession({ sessionId, cwd: built.persistenceRoot, mcpServers: [] })
+
+    const replayed = built.sessionUpdates.slice(before)
+      .filter(({ update }) => update.sessionUpdate === 'agent_message_chunk')
+    expect(replayed.some(({ update }) =>
+      'messageId' in update && update.messageId === 'cmd-replay'
+      && update.content.type === 'text' && update.content.text === 'Goal paused')).toBe(true)
+  })
+
+  it('answers busy rather than promptRequired while a command is running', async () => {
+    const built = await withGoalCommand()
+    const { sessionId } = await built.client.newSession({ cwd: built.persistenceRoot, mcpServers: [] })
+    let release: (() => void) | undefined
+    let entered: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const started = new Promise<void>((resolve) => { entered = resolve })
+    const executing = built.commands!.execute
+    built.commands!.execute = async (...args) => {
+      entered!()
+      await gate
+      return executing.call(built.commands!, ...args)
+    }
+
+    const prompt = built.client.prompt({ sessionId, prompt: [{ type: 'text', text: '/goal pause' }] })
+    await started
+    // A new prompt would be rejected by the command slot, so steering must not
+    // tell the client to send one.
+    await expect(built.client.steer({
+      sessionId,
+      prompt: [{ type: 'text', text: 'follow-up' }],
+    })).resolves.toEqual({ outcome: 'busy' })
+
+    await built.client.cancel({ sessionId })
+    release!()
+    await expect(prompt).resolves.toEqual({ stopReason: 'cancelled' })
+  })
+
+  it('waits for a running command and aborts it before closing', async () => {
+    const built = await withGoalCommand()
+    const { sessionId } = await built.client.newSession({ cwd: built.persistenceRoot, mcpServers: [] })
+    let release: (() => void) | undefined
+    let entered: (() => void) | undefined
+    const gate = new Promise<void>((resolve) => { release = resolve })
+    const started = new Promise<void>((resolve) => { entered = resolve })
+    const executing = built.commands!.execute
+    let signal: AbortSignal | undefined
+    built.commands!.execute = async (...args) => {
+      signal = args[3]
+      entered!()
+      await gate
+      return executing.call(built.commands!, ...args)
+    }
+
+    const prompt = built.client.prompt({ sessionId, prompt: [{ type: 'text', text: '/goal pause' }] })
+    await started
+    let closed = false
+    const closing = Promise.resolve(built.client.closeSession({ sessionId }))
+      .then((response) => { closed = true; return response })
+    await vi.waitFor(() => { expect(signal?.aborted).toBe(true) })
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    // Close must hold the session open while the handler still runs.
+    expect(closed).toBe(false)
+
+    release!()
+    await expect(closing).resolves.toEqual({})
+    await expect(prompt).resolves.toEqual({ stopReason: 'cancelled' })
+    expect(deliveredAgentText(built)).not.toContain('Goal paused')
+  })
+
+  it('rejects a command prompt after the agent was disposed', async () => {
+    const built = await withGoalCommand()
+    const { sessionId } = await built.client.newSession({ cwd: built.persistenceRoot, mcpServers: [] })
+    await built.loopFiber.dispose()
+
+    await expect(built.client.prompt({ sessionId, prompt: [{ type: 'text', text: '/goal pause' }] }))
+      .rejects.toThrow(/prompt was not queued/)
+    expect(built.commands!.executed).toEqual([])
   })
 })

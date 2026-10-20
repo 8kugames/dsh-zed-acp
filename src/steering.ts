@@ -8,14 +8,18 @@
  * `_session/steering` is unaffected — `session/prompt` and `session/cancel`
  * carry the whole standard contract.
  *
- * The outcome vocabulary is deliberately two-valued:
+ * The outcome vocabulary distinguishes three states:
  *
  * - `injected` — the message joined the running turn and the client keeps
  *   whatever `session/prompt` request it already has open. The bridge never
  *   opens a prompt request of its own, so the turn's stop reason and output
  *   stream still belong to the request the client made.
- * - `promptRequired` with `reason: 'noRunningTurn'` — nothing was running to
- *   join. The client sends an ordinary `session/prompt` instead.
+ * - `promptRequired` with `reason: 'noRunningTurn'` — nothing holds the
+ *   session's dispatch slot. The client sends an ordinary `session/prompt`.
+ * - `busy` — a prompt request is still in flight (in admission, already ended
+ *   while its settlement waits on background descendants, or being cancelled),
+ *   or a slash command is executing. The client must not send a prompt: the
+ *   slot is held until that work settles.
  *
  * `_meta.steering.idleBehavior` is a real, validated field: `promptRequired` is
  * the only policy this bridge implements, so any other value is `invalidParams`
@@ -45,19 +49,25 @@ export interface AcpSteeringRequest {
   readonly prompt: readonly ContentBlock[]
 }
 
-/** The two outcomes a steering request can report. */
+/** The outcomes a steering request can report. */
 export type AcpSteeringOutcome =
   | { outcome: 'injected' }
   | { outcome: 'promptRequired'; reason: 'noRunningTurn' }
+  | { outcome: 'busy' }
 
 /** Report that the request joined a running turn. */
 export function steeringInjected(): AcpSteeringOutcome {
   return { outcome: 'injected' }
 }
 
-/** Report that nothing was running, so the client must open its own prompt. */
+/** Report that no prompt is in flight, so the client must open its own. */
 export function steeringPromptRequired(): AcpSteeringOutcome {
   return { outcome: 'promptRequired', reason: 'noRunningTurn' }
+}
+
+/** Report that an open prompt or command still holds the dispatch slot. */
+export function steeringBusy(): AcpSteeringOutcome {
+  return { outcome: 'busy' }
 }
 
 function invalid(detail: string): RequestError {

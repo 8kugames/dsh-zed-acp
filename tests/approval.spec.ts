@@ -1,5 +1,5 @@
-import { afterEach, describe, expect, it } from 'vitest'
-import { PROTOCOL_VERSION } from '@agentclientprotocol/sdk'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { PROTOCOL_VERSION, type RequestPermissionResponse } from '@agentclientprotocol/sdk'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { SessionId } from '@deepseek-ai/dsh-session'
@@ -63,6 +63,22 @@ describe('ACP machine permission policy', () => {
     const request = await ownedRequest()
     harness.onPermission = () => { throw new Error('client gone') }
     await expect(harness.ctx.approval.request(request)).resolves.toBe('unavailable')
+  })
+
+  it('withdraws the client permission request when the asker aborts', async () => {
+    harness = await makeBridgeHarness()
+    const controller = new AbortController()
+    const permission = Promise.withResolvers<RequestPermissionResponse>()
+    harness.onPermission = () => permission.promise
+    const request = await ownedRequest({ signal: controller.signal })
+
+    const pending = harness.ctx.approval.request(request)
+    await vi.waitFor(() => { expect(harness!.permissionRequests).toHaveLength(1) })
+    controller.abort(new Error('turn cancelled'))
+
+    await expect(pending).resolves.toBe('cancelled')
+    await vi.waitFor(() => { expect(harness!.permissionRequestSignals[0]?.aborted).toBe(true) })
+    permission.resolve({ outcome: { outcome: 'cancelled' } })
   })
 
   it('delegates a same-id foreign agent', async () => {
