@@ -10,6 +10,16 @@
 - 发布链路改走 npm Trusted Publishing：GitHub Actions 的 publish job 移除 `NODE_AUTH_TOKEN`，改由 `id-token: write` 的 OIDC 令牌换取短期发布凭据，仓库不再依赖长期 npm token。workflow 仍会在 tag 上先跑三平台测试矩阵，并断言 tag 与 `package.json`、`registry/agent.json` 的版本一致；`workflow_dispatch` 允许手动运行测试。
 - 仓库脱离上游 fork 网络，作为独立仓库 `8kugames/dsh-zed-acp` 存在：上游仅以已发布的 dsh npm 包形式消费，不再配置 `upstream` remote；两份 README 与 `THIRD_PARTY_NOTICES.md` 补充独立项目、问题跟踪与非背书声明，`package.json` 补齐 author/homepage/bugs/keywords。MIT 许可与 DeepSeek 的版权归属保持不变。
 
+### 修复
+
+- prompt 与会话生命周期的审计缺口：斜杠命令执行现在被跟踪，`session/cancel` 会中止它，`session/close` 在 flush/dispose 前等待 handler 结束；关闭路径改为异常安全（取消失败被容纳、宿主已处置的 agent 不重复 flush/dispose、回滚失败不掩盖原始错误）。`_session/steering` 在 prompt 或斜杠命令仍占用派发槽时返回 `{ outcome: "busy" }`，不再把客户端送进会被并发闸门拒绝的 prompt；在 `session/new`/`resume`/`load`/`fork` 激活完成前被取消的请求不再发布会话；审批对话框随回合取消或会话关闭撤回；取消的 prompt 清掉路由钉住状态与工具卡展示，`session/load` 重放 `command/done` 文本。
+- inclusive fork 的消息定位：助手分块改用文档约定的 `<turn>:<step>` `messageId`，同时接受旧版 bridge 发出的持久消息 UUID（含 segment 后缀），旧客户端捕获的 id 仍可解析；存在但不是对象的 `jetbrains.air` 扩展块改为 `invalidParams`，不再静默退化成整会话复制；按从 1 开始的 `messageOccurrence` 精确选择指纹命中，越界即拒绝。
+- 入站 NDJSON 行长限制此前只检查尾部未完成行：一次写入若包含一条超限行后紧跟换行，计数会被重置而超限行从未被检查。现在扫描 chunk 与跨 chunk 尾部的每个换行，在第一条超限行处失败。顺带修正价格注释中仍写 USD 默认值的两处，平铺费率默认是 CNY。
+
+### 文档
+
+- README 与 `docs/zed-acp*.md` 记录上述生命周期与 fork 契约：steering 仅在派发槽空闲时回答 `promptRequired`，被 prompt 或斜杠命令占用时回答 `busy`；inclusive fork 接受旧版消息 UUID，畸形的 `jetbrains.air` 元数据回 `invalidParams`。
+
 ## [0.3.5] - 2026-10-17
 
 ### 新增
