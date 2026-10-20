@@ -67,4 +67,21 @@ describe('WireLineLimiter', () => {
     await settled
     expect(failures[0]?.message).toContain('exceeds 8 bytes')
   })
+
+  it('checks every completed line inside one write', async () => {
+    const limiter = new WireLineLimiter(8)
+    // The oversized line is followed by another newline in the same chunk; a
+    // trailing-partial-only counter would reset to 2 and miss it.
+    const { failures, settled } = drain(limiter, [Buffer.from('a'.repeat(9) + '\nok\n')])
+    await settled
+    expect(failures).toHaveLength(1)
+    expect(failures[0]?.message).toContain('exceeds 8 bytes')
+  })
+
+  it('checks an oversized middle line with a valid trailing partial', async () => {
+    const limiter = new WireLineLimiter(8)
+    const { failures, settled } = drain(limiter, [Buffer.from('ok\n' + 'a'.repeat(9) + '\nx')])
+    await settled
+    expect(failures).toHaveLength(1)
+  })
 })

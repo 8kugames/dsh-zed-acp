@@ -46,7 +46,7 @@ export interface UsagePrice {
 
 /** Env-override entry: flat rates applied at every hour. */
 export interface FlatPriceEntry extends UsagePrice {
-  /** ISO 4217 code; defaults to USD. */
+  /** ISO 4217 code; defaults to CNY. */
   currency: string
 }
 
@@ -75,7 +75,7 @@ export interface PriceTable {
    * turn to learn one from. Declared by the deployment as the config
    * `prices.defaultCurrency` or the document's `$defaultCurrency` meta key, CNY
    * when it names none. It does not change the entries' own `currency`, which
-   * still defaults to USD.
+   * still defaults to CNY.
    */
   defaultCurrency: string
 }

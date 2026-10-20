@@ -64,12 +64,40 @@ export class WireLineLimiter extends Transform {
 
   override _transform(chunk: Buffer | string, _encoding: string, callback: (error?: Error | null, data?: never) => void): void {
     const data = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk
-    const lastNewline = data.lastIndexOf(0x0a)
-    // Bytes after the last newline belong to the line still being assembled;
-    // everything before it closed earlier (already-counted) lines.
-    this.lineBytes = lastNewline === -1 ? this.lineBytes + data.length : data.length - lastNewline - 1
-    if (this.lineBytes > this.maxLineBytes) {
+    const fail = (): void => {
       callback(new Error(`acp wire line exceeds ${this.maxLineBytes} bytes`))
+    }
+    // Every completed line in this chunk must be checked, not just the
+    // trailing partial: a single write can carry an oversized line followed by
+    // another newline, which would otherwise reset the counter unseen.
+    const firstNewline = data.indexOf(0x0a)
+    if (firstNewline === -1) {
+      this.lineBytes += data.length
+      if (this.lineBytes > this.maxLineBytes) {
+        fail()
+        return
+      }
+      callback(null, data as never)
+      return
+    }
+    // The first completed line began in a previous chunk (or at this one's start).
+    if (this.lineBytes + firstNewline > this.maxLineBytes) {
+      fail()
+      return
+    }
+    let lineStart = firstNewline + 1
+    for (;;) {
+      const nextNewline = data.indexOf(0x0a, lineStart)
+      if (nextNewline === -1) break
+      if (nextNewline - lineStart > this.maxLineBytes) {
+        fail()
+        return
+      }
+      lineStart = nextNewline + 1
+    }
+    this.lineBytes = data.length - lineStart
+    if (this.lineBytes > this.maxLineBytes) {
+      fail()
       return
     }
     callback(null, data as never)
