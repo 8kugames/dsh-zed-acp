@@ -3,6 +3,13 @@
 本项目的所有显著变更都会记录在此文件。本格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0)，
 本项目遵循[语义化版本](https://semver.org/lang/zh-CN/1.1.0/)；各版本日期为 UTC 发布日。
 
+## [0.3.6] - 2026-10-20
+
+### 变更
+
+- 发布链路改走 npm Trusted Publishing：GitHub Actions 的 publish job 移除 `NODE_AUTH_TOKEN`，改由 `id-token: write` 的 OIDC 令牌换取短期发布凭据，仓库不再依赖长期 npm token。workflow 仍会在 tag 上先跑三平台测试矩阵，并断言 tag 与 `package.json`、`registry/agent.json` 的版本一致；`workflow_dispatch` 允许手动运行测试。
+- 仓库脱离上游 fork 网络，作为独立仓库 `8kugames/dsh-zed-acp` 存在：上游仅以已发布的 dsh npm 包形式消费，不再配置 `upstream` remote；两份 README 与 `THIRD_PARTY_NOTICES.md` 补充独立项目、问题跟踪与非背书声明，`package.json` 补齐 author/homepage/bugs/keywords。MIT 许可与 DeepSeek 的版权归属保持不变。
+
 ## [0.3.5] - 2026-10-17
 
 ### 新增
